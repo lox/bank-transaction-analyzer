@@ -30,6 +30,7 @@ type TransactionDetails struct {
 	Category      string          `json:"category,omitempty"`
 	Description   string          `json:"description,omitempty"`
 	CardNumber    string          `json:"card_number,omitempty"`
+	SearchBody    string          `json:"search_body,omitempty"`
 	ForeignAmount *struct {
 		Amount   decimal.Decimal `json:"amount"`
 		Currency string          `json:"currency"`

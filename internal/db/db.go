@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	_ "github.com/knaka/go-sqlite3-fts5"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/shopspring/decimal"
 
@@ -76,6 +77,7 @@ func createTables(db *sql.DB) error {
 			details_category TEXT,
 			description TEXT,
 			card_number TEXT,
+			search_body TEXT,
 			-- Foreign amount details
 			foreign_amount DECIMAL(15,2),
 			foreign_currency TEXT,
@@ -83,7 +85,28 @@ func createTables(db *sql.DB) error {
 			transfer_to_account TEXT,
 			transfer_from_account TEXT,
 			transfer_reference TEXT
-		)
+		);
+
+		-- Create virtual table for full-text search
+		CREATE VIRTUAL TABLE IF NOT EXISTS transactions_fts USING fts5(
+			search_body,
+			content='transactions',
+			content_rowid='rowid'
+		);
+
+		-- Create trigger to keep FTS table in sync
+		CREATE TRIGGER IF NOT EXISTS transactions_ai AFTER INSERT ON transactions BEGIN
+			INSERT INTO transactions_fts(rowid, search_body) VALUES (new.rowid, new.search_body);
+		END;
+
+		CREATE TRIGGER IF NOT EXISTS transactions_ad AFTER DELETE ON transactions BEGIN
+			INSERT INTO transactions_fts(transactions_fts, rowid, search_body) VALUES('delete', old.rowid, old.search_body);
+		END;
+
+		CREATE TRIGGER IF NOT EXISTS transactions_au AFTER UPDATE ON transactions BEGIN
+			INSERT INTO transactions_fts(transactions_fts, rowid, search_body) VALUES('delete', old.rowid, old.search_body);
+			INSERT INTO transactions_fts(rowid, search_body) VALUES (new.rowid, new.search_body);
+		END;
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to create transactions table: %v", err)
@@ -123,13 +146,13 @@ func (d *DB) Store(ctx context.Context, t types.Transaction, details *types.Tran
 	_, err := d.db.ExecContext(ctx, `
 		INSERT OR REPLACE INTO transactions (
 			id, date, amount, payee,
-			type, merchant, location, details_category, description, card_number,
+			type, merchant, location, details_category, description, card_number, search_body,
 			foreign_amount, foreign_currency,
 			transfer_to_account, transfer_from_account, transfer_reference
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		id, date, t.Amount, t.Payee,
-		details.Type, details.Merchant, details.Location, details.Category, details.Description, details.CardNumber,
+		details.Type, details.Merchant, details.Location, details.Category, details.Description, details.CardNumber, details.SearchBody,
 		getForeignAmount(details), getForeignCurrency(details),
 		getTransferToAccount(details), getTransferFromAccount(details), getTransferReference(details),
 	)
@@ -155,12 +178,12 @@ func (d *DB) Get(ctx context.Context, t types.Transaction) (*types.TransactionDe
 	var transferReference sql.NullString
 
 	err := d.db.QueryRowContext(ctx, `
-		SELECT date, amount, type, merchant, location, details_category, description, card_number,
+		SELECT date, amount, type, merchant, location, details_category, description, card_number, search_body,
 			foreign_amount, foreign_currency,
 			transfer_to_account, transfer_from_account, transfer_reference
 		FROM transactions WHERE id = ?
 	`, id).Scan(
-		&date, &amount, &details.Type, &details.Merchant, &details.Location, &details.Category, &details.Description, &details.CardNumber,
+		&date, &amount, &details.Type, &details.Merchant, &details.Location, &details.Category, &details.Description, &details.CardNumber, &details.SearchBody,
 		&foreignAmount, &foreignCurrency,
 		&transferToAccount, &transferFromAccount, &transferReference,
 	)
@@ -308,6 +331,84 @@ func (d *DB) GetTransactions(ctx context.Context, days int) ([]types.Transaction
 	rows, err := d.db.QueryContext(ctx, query, -days)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query transactions: %w", err)
+	}
+	defer rows.Close()
+
+	var transactions []types.TransactionWithDetails
+	for rows.Next() {
+		var t types.TransactionWithDetails
+		var date time.Time
+		var amount decimal.Decimal
+		var foreignAmount sql.NullFloat64
+		var foreignCurrency sql.NullString
+		var transferToAccount sql.NullString
+		var transferFromAccount sql.NullString
+		var transferReference sql.NullString
+
+		if err := rows.Scan(
+			&date, &amount, &t.Payee,
+			&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
+			&foreignAmount, &foreignCurrency,
+			&transferToAccount, &transferFromAccount, &transferReference,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan transaction: %w", err)
+		}
+
+		// Format date and amount as strings
+		t.Date = date.Format("02/01/2006")
+		t.Amount = amount.String()
+
+		// Set foreign amount if present
+		if foreignAmount.Valid && foreignCurrency.Valid {
+			t.Details.ForeignAmount = &struct {
+				Amount   decimal.Decimal `json:"amount"`
+				Currency string          `json:"currency"`
+			}{
+				Amount:   decimal.NewFromFloat(foreignAmount.Float64),
+				Currency: foreignCurrency.String,
+			}
+		}
+
+		// Set transfer details if present
+		if transferToAccount.Valid || transferFromAccount.Valid || transferReference.Valid {
+			t.Details.TransferDetails = &struct {
+				ToAccount   string `json:"to_account,omitempty"`
+				FromAccount string `json:"from_account,omitempty"`
+				Reference   string `json:"reference,omitempty"`
+			}{
+				ToAccount:   transferToAccount.String,
+				FromAccount: transferFromAccount.String,
+				Reference:   transferReference.String,
+			}
+		}
+
+		transactions = append(transactions, t)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating transactions: %w", err)
+	}
+
+	return transactions, nil
+}
+
+// SearchTransactions searches for transactions using full-text search
+func (d *DB) SearchTransactions(ctx context.Context, query string, days int) ([]types.TransactionWithDetails, error) {
+	searchQuery := `
+		SELECT t.date, t.amount, t.payee,
+			t.type, t.merchant, t.location, t.details_category, t.description, t.card_number,
+			t.foreign_amount, t.foreign_currency,
+			t.transfer_to_account, t.transfer_from_account, t.transfer_reference
+		FROM transactions t
+		JOIN transactions_fts fts ON t.rowid = fts.rowid
+		WHERE fts.search_body MATCH ?
+		AND t.date >= date('now', ? || ' days')
+		ORDER BY t.date DESC
+	`
+
+	rows, err := d.db.QueryContext(ctx, searchQuery, query, -days)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search transactions: %w", err)
 	}
 	defer rows.Close()
 

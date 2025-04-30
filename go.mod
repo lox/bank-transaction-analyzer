@@ -6,6 +6,7 @@ require (
 	github.com/alecthomas/kong v0.9.0
 	github.com/avast/retry-go/v4 v4.6.1
 	github.com/charmbracelet/log v0.4.1
+	github.com/knaka/go-sqlite3-fts5 v0.0.0-20240729040425-e53b86878d0d
 	github.com/mark3labs/mcp-go v0.23.1
 	github.com/mattn/go-sqlite3 v1.14.28
 	github.com/sashabaranov/go-openai v1.19.2

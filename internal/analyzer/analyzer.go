@@ -211,6 +211,7 @@ Return the information in JSON format with these fields:
 - card_number: The full card number if present in the format "Card XXXX...XXXX"
 - foreign_amount: If there's a foreign currency, include amount (as number) and currency code
 - transfer_details: For transfers, include to_account, from_account, and reference
+- search_body: A concatenated string of all relevant searchable information, including merchant, location, description, and any other relevant details. This should be a single string that can be used for full-text search.
 
 Example responses:
 
@@ -220,7 +221,8 @@ Restaurant Purchase:
   "merchant": "Mr. Brojangles",
   "location": "Bright",
   "category": "Food & Dining",
-  "description": "Coffee and pastries"
+  "description": "Coffee and pastries",
+  "search_body": "Mr. Brojangles Bright Coffee and pastries Food & Dining"
 }
 
 Food Delivery:
@@ -228,7 +230,8 @@ Food Delivery:
   "type": "purchase",
   "merchant": "Uber Eats",
   "category": "Food & Dining",
-  "description": "Food delivery"
+  "description": "Food delivery",
+  "search_body": "Uber Eats Food delivery Food & Dining"
 }
 
 Retail Purchase:
@@ -237,7 +240,8 @@ Retail Purchase:
   "merchant": "Coles",
   "location": "Bright",
   "category": "Groceries",
-  "description": "Grocery shopping"
+  "description": "Grocery shopping",
+  "search_body": "Coles Bright Grocery shopping Groceries"
 }
 
 Foreign Currency Purchase:
@@ -249,7 +253,8 @@ Foreign Currency Purchase:
   "foreign_amount": {
     "amount": 5.00,
     "currency": "USD"
-  }
+  },
+  "search_body": "CLOUDFLARE Cloud services Services USD"
 }
 
 Transfer:
@@ -261,7 +266,8 @@ Transfer:
   "transfer_details": {
     "to_account": "12345678",
     "reference": "Rent May 2024"
-  }
+  },
+  "search_body": "John Smith Rent payment Transfers 12345678 Rent May 2024"
 }
 
 Card Purchase:
@@ -270,7 +276,8 @@ Card Purchase:
   "merchant": "Netflix",
   "category": "Entertainment",
   "description": "Monthly subscription",
-  "card_number": "4622631234561847"
+  "card_number": "4622631234561847",
+  "search_body": "Netflix Monthly subscription Entertainment 4622631234561847"
 }`, t.Payee, t.Amount, t.Date)
 
 	var details *types.TransactionDetails
