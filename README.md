@@ -99,6 +99,7 @@ And then chat with your data, the current tools are supported:
 | Tool Name | Description |
 |-----------|-------------|
 | `get_transactions` | Retrieves transactions from the database for a specified number of days. Requires a `days` parameter (integer) that determines how far back to look for transactions. Returns formatted transaction details including date, amount, payee, type, merchant, location, category, description, card number, foreign amount (if applicable), and transfer details (if applicable). |
+| `search_transaction_freetext` | Searches transactions using free-text search. Requires a `query` parameter (string) for the search term and a `days` parameter (integer) to specify how far back to search. Supports SQLite FTS5 syntax for advanced search capabilities. Returns matching transactions with full details. |
 
 
 ## How it Works

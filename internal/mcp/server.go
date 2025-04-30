@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strconv"
 	"time"
 
@@ -55,19 +56,19 @@ func (s *Server) Run() error {
 
 	mcpServer.AddTool(mcp.NewTool("get_transactions",
 		mcp.WithDescription("Get transactions from the database"),
-		mcp.WithNumber("days",
+		mcp.WithString("days",
 			mcp.Required(),
 			mcp.Description("Number of days to look back (must be a positive integer greater than 0)"),
 		),
 	), s.getTransactionsHandler)
 
-	mcpServer.AddTool(mcp.NewTool("search_transactions",
+	mcpServer.AddTool(mcp.NewTool("search_transaction_freetext",
 		mcp.WithDescription("Search transactions using full-text search"),
 		mcp.WithString("query",
 			mcp.Required(),
 			mcp.Description("Search query (supports SQLite FTS5 syntax)"),
 		),
-		mcp.WithNumber("days",
+		mcp.WithString("days",
 			mcp.Required(),
 			mcp.Description("Number of days to look back (integer)"),
 		),
@@ -82,6 +83,8 @@ func (s *Server) Run() error {
 }
 
 func (s *Server) getTransactionsHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	s.logger.Debug("Getting transactions", "request", request, "type", reflect.TypeOf(request.Params.Arguments["days"]))
+
 	var days int
 	switch v := request.Params.Arguments["days"].(type) {
 	case float64:
