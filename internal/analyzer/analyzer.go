@@ -5,170 +5,123 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
-	"time"
 
 	"github.com/avast/retry-go/v4"
 	"github.com/charmbracelet/log"
-	"github.com/lox/ing-transaction-parser/internal/qif"
+	"github.com/lox/ing-transaction-analyzer/internal/db"
+	"github.com/lox/ing-transaction-analyzer/internal/types"
 	"github.com/sashabaranov/go-openai"
 	"golang.org/x/sync/errgroup"
 )
 
-// TransactionGroup represents a group of similar transactions
-type TransactionGroup struct {
-	Transactions []qif.Transaction
-	Similarity   float64
+type Config struct {
+	Model       string
+	Concurrency int
+	Progress    bool
 }
 
-type AnalysisConfig struct {
-	EmbeddingModel string
-	AnalysisModel  string
-	Concurrency    int
-	LLMClient      *openai.Client
+type Analyzer struct {
+	client *openai.Client
+	logger *log.Logger
+	db     *db.DB
 }
 
-// AnalyzeTransactions uses embeddings to find similar transactions and then analyzes them with GPT-4
-func AnalyzeTransactions(ctx context.Context, client *openai.Client, transactions []qif.Transaction, progress Progress, logger *log.Logger, store *EmbeddingStore, config AnalysisConfig) (string, error) {
-	// Ensure the LLMClient is set
-	if config.LLMClient == nil {
-		config.LLMClient = client
+type AnalyzedTransaction struct {
+	types.Transaction
+	Details *types.TransactionDetails
+}
+
+// NewAnalyzer creates a new transaction parser
+func NewAnalyzer(client *openai.Client, logger *log.Logger, db *db.DB) *Analyzer {
+	return &Analyzer{
+		client: client,
+		logger: logger,
+		db:     db,
 	}
+}
 
-	// Check which transactions need embeddings
-	status, err := store.GetEmbeddingStatus(ctx, transactions)
+// AnalyzeTransactions processes transactions in parallel and stores their details
+func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types.Transaction, config Config) ([]AnalyzedTransaction, error) {
+	// Filter out transactions that already exist in the database
+	filteredTransactions, err := a.db.FilterExistingTransactions(ctx, transactions)
 	if err != nil {
-		return "", fmt.Errorf("error checking embedding status: %v", err)
+		return nil, fmt.Errorf("error filtering existing transactions: %w", err)
 	}
 
-	// Count how many we need to generate
-	var toGenerate []int
-	for i, exists := range status {
-		if !exists {
-			toGenerate = append(toGenerate, i)
-		}
+	// Create progress bar
+	var progress Progress
+	if !config.Progress {
+		progress = NewNoopProgress()
+	} else {
+		progress = NewBarProgress(len(filteredTransactions))
 	}
 
-	if len(toGenerate) == 0 {
-		logger.Info("All embeddings already exist")
-		return "", nil
-	}
+	a.logger.Info("Analyzing transactions", "total", len(filteredTransactions), "skipped", len(transactions)-len(filteredTransactions))
 
-	logger.Info("Starting embedding generation", "count", len(toGenerate), "model", config.EmbeddingModel, "concurrency", config.Concurrency)
+	analyzedTransactions := make([]AnalyzedTransaction, len(transactions))
 
-	// Generate and store embeddings
-	if err := generateEmbeddings(ctx, transactions, config, logger, store, progress); err != nil {
-		return "", fmt.Errorf("error generating embeddings: %v", err)
-	}
-
-	// Check if context was canceled during embedding generation
-	if err := ctx.Err(); err != nil {
-		return "", fmt.Errorf("operation interrupted during embedding generation")
-	}
-
-	logger.Info("Embedding generation complete", "count", len(toGenerate))
-
-	// Group similar transactions
-	groups, err := groupSimilarTransactions(transactions, store)
-	if err != nil {
-		return "", fmt.Errorf("error grouping similar transactions: %v", err)
-	}
-
-	// Analyze each group
-	var analysis strings.Builder
-	for i, group := range groups {
-		if len(group.Transactions) < 2 {
-			continue // Skip single transactions
-		}
-
-		groupAnalysis, err := analyzeGroup(ctx, client, group, config.AnalysisModel)
-		if err != nil {
-			return "", fmt.Errorf("error analyzing group %d: %v", i, err)
-		}
-
-		analysis.WriteString(fmt.Sprintf("\nGroup %d (Similarity: %.2f):\n", i+1, group.Similarity))
-		analysis.WriteString(groupAnalysis)
-		analysis.WriteString("\n---\n")
-	}
-
-	return analysis.String(), nil
-}
-
-// generateEmbeddings generates embeddings for transactions in parallel and stores them as they are generated
-func generateEmbeddings(ctx context.Context, transactions []qif.Transaction, config AnalysisConfig, logger *log.Logger, store *EmbeddingStore, progress Progress) error {
-	// Check if context is already canceled
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("context canceled before starting embedding generation")
-	}
-
-	// Create an errgroup with the specified concurrency
+	// Process transactions in parallel
 	g, gCtx := errgroup.WithContext(ctx)
 	g.SetLimit(config.Concurrency)
 
-	// Process transactions in parallel
-	for i, t := range transactions {
-		i, t := i, t // Create new variables for the goroutine
+	for _, t := range transactions {
+		exists, err := a.db.Has(ctx, t)
+		if err != nil {
+			return nil, fmt.Errorf("error checking if transaction exists: %w", err)
+		}
+		if exists {
+			analyzed, err := a.db.Get(ctx, t)
+			if err != nil {
+				return nil, fmt.Errorf("error getting transaction details: %w", err)
+			}
+			analyzedTransactions = append(analyzedTransactions, AnalyzedTransaction{
+				Transaction: t,
+				Details:     analyzed,
+			})
+			continue
+		}
+
+		t := t // Create new variable for the goroutine
 		g.Go(func() error {
 			// Check if context is canceled before starting
 			if err := gCtx.Err(); err != nil {
 				return err
 			}
 
-			// Create the embedding text using only the payee
-			text := t.Payee
-			logger.Debug("Generating embedding", "transaction", i, "text", text)
-
-			var resp openai.EmbeddingResponse
-			// Use retry-go to handle retries with exponential backoff
-			err := retry.Do(
-				func() error {
-					// Create a new context with a timeout for each attempt
-					requestCtx, cancel := context.WithTimeout(gCtx, 30*time.Second)
-					defer cancel()
-
-					// Generate the embedding
-					var err error
-					resp, err = config.LLMClient.CreateEmbeddings(requestCtx, openai.EmbeddingRequest{
-						Model: openai.EmbeddingModel(config.EmbeddingModel),
-						Input: []string{text},
-					})
-					if err != nil {
-						// Check if it was the parent context that was canceled
-						if gCtx.Err() != nil {
-							return retry.Unrecoverable(fmt.Errorf("embedding generation interrupted"))
-						}
-						return err
-					}
-					return nil
-				},
-				retry.Context(gCtx),
-				retry.Attempts(3),
-				retry.Delay(5*time.Second),
-				retry.DelayType(retry.BackOffDelay),
-				retry.OnRetry(func(n uint, err error) {
-					logger.Warn("Retrying embedding generation", "transaction", i, "attempt", n+1, "error", err)
-				}),
-				retry.RetryIf(func(err error) bool {
-					// Don't retry if the context was canceled
-					return !errors.Is(err, context.Canceled)
-				}),
-			)
-
+			// Parse transaction details
+			details, err := a.analyzeTransaction(gCtx, t, config.Model)
 			if err != nil {
+				// If context was canceled, return immediately
 				if errors.Is(err, context.Canceled) {
-					return fmt.Errorf("embedding generation interrupted")
+					return err
 				}
-				return fmt.Errorf("error creating embedding for transaction %d after retries: %v", i, err)
+				a.logger.Error("Failed to analyze transaction",
+					"error", err,
+					"payee", t.Payee)
+				return fmt.Errorf("error analyzing transaction: %w", err)
 			}
 
-			// Store the embedding immediately
-			if err := store.StoreEmbedding(gCtx, t, resp.Data[0].Embedding); err != nil {
-				return fmt.Errorf("error storing embedding for transaction %d: %v", i, err)
+			analyzedTransactions = append(analyzedTransactions, AnalyzedTransaction{
+				Transaction: t,
+				Details:     details,
+			})
+
+			// Store transaction details
+			if err := a.db.Store(gCtx, t, details); err != nil {
+				// If context was canceled, return immediately
+				if errors.Is(err, context.Canceled) {
+					return err
+				}
+				return fmt.Errorf("error storing transaction: %w", err)
 			}
 
 			// Update progress
 			if err := progress.Add(1); err != nil {
-				return fmt.Errorf("error updating progress: %v", err)
+				// If context was canceled, return immediately
+				if errors.Is(err, context.Canceled) {
+					return err
+				}
+				return fmt.Errorf("error updating progress: %w", err)
 			}
 
 			return nil
@@ -177,111 +130,233 @@ func generateEmbeddings(ctx context.Context, transactions []qif.Transaction, con
 
 	// Wait for all goroutines to complete
 	if err := g.Wait(); err != nil {
-		// If the error is due to context cancellation, return a more specific error
 		if errors.Is(err, context.Canceled) {
-			return fmt.Errorf("embedding generation interrupted")
+			a.logger.Info("Transaction analysis interrupted by user")
+			return nil, err
 		}
-		return fmt.Errorf("error generating embeddings: %v", err)
+		return nil, fmt.Errorf("error analyzing transactions: %w", err)
 	}
 
-	return nil
+	a.logger.Info("Successfully analyzed transactions", "total", len(filteredTransactions), "skipped", len(transactions)-len(filteredTransactions))
+	return analyzedTransactions, nil
 }
 
-func groupSimilarTransactions(transactions []qif.Transaction, store *EmbeddingStore) ([]TransactionGroup, error) {
-	groups := make([]TransactionGroup, 0)
-	used := make(map[int]bool)
+// analyzeTransaction uses an LLM to extract structured information from a transaction
+func (a *Analyzer) analyzeTransaction(ctx context.Context, t types.Transaction, model string) (*types.TransactionDetails, error) {
+	a.logger.Debug("Analyzing transaction",
+		"payee", t.Payee,
+		"amount", t.Amount,
+		"date", t.Date,
+		"model", model)
 
-	for i, t := range transactions {
-		if used[i] {
-			continue
-		}
+	prompt := fmt.Sprintf(`Extract structured information from this transaction description.
+Classify the transaction type and extract relevant details.
 
-		// Find similar transactions using the embedding store
-		similarTransactions, similarities, err := store.FindSimilarTransactions(context.Background(), t, len(transactions))
-		if err != nil {
-			return nil, fmt.Errorf("error finding similar transactions: %v", err)
-		}
+IMPORTANT RULES:
+1. Remove payment processor prefixes and suffixes:
+   - Remove "SQ *" (Square)
+   - Remove "Visa Purchase", "EFTPOS Purchase"
+   - Remove "Receipt" and receipt numbers
+   - Remove "Date", "Time" and timestamps
+   - Remove "Card" and card numbers
+2. Extract location even if it's at the end of the merchant name
+3. Use consistent categories from this list:
+   - Food & Dining (restaurants, cafes, food delivery)
+   - Shopping (retail stores, online shopping)
+   - Transportation (Uber, taxis, public transport)
+   - Entertainment (movies, events, festivals)
+   - Services (utilities, subscriptions, professional services)
+   - Personal Care (health, beauty, fitness)
+   - Travel (flights, accommodation, travel services)
+   - Education (courses, books, educational services)
+   - Home (furniture, appliances, home improvement)
+   - Groceries (supermarkets, food stores)
+   - Bank Fees (fees, charges, interest)
+   - Transfers (personal transfers, payments)
+   - Other (anything that doesn't fit above categories)
+4. For foreign amounts:
+   - amount must be a number (float) without currency symbol
+   - currency must be the 3-letter currency code
+5. Special handling for food delivery services:
+   - For Uber Eats, use "Uber Eats" as merchant name
+   - For DoorDash, use "DoorDash" as merchant name
+   - For Menulog, use "Menulog" as merchant name
+   - Category should be "Food & Dining" for all food delivery services
+6. Clean merchant names:
+   - Remove any domain names (e.g., .com, .co)
+   - Remove any help/support text
+   - Use the main brand name only
+7. Description field rules:
+   - NEVER include the amount in the description
+   - Provide a brief description of what was purchased
+   - For restaurants/cafes, describe the type of food or service
+   - For retail, describe the type of items purchased
+   - For services, describe the service provided
+   - Keep descriptions concise but informative
+8. Card number extraction:
+   - If a card number is present in the format "Card XXXX...XXXX", extract it
+   - Store the full card number in the card_number field
+   - Do not mask or truncate the card number
 
-		// Create a group with the current transaction and its similar ones
-		group := TransactionGroup{
-			Transactions: []qif.Transaction{t},
-		}
+Transaction: %s
+Amount: %s
+Date: %s
 
-		// Add similar transactions to the group
-		for j, similarT := range similarTransactions {
-			// Skip the first one as it's the same as t
-			if j == 0 {
-				continue
-			}
+Return the information in JSON format with these fields:
+- type: One of: purchase, transfer, fee, deposit, withdrawal, refund, interest
+- merchant: The main merchant or business name (clean, without location, receipt info, or payment processor prefixes)
+- location: The location where the transaction occurred (if present)
+- category: A general category from the list above
+- description: Clean description without receipt numbers, card details, or payment processor info
+- card_number: The full card number if present in the format "Card XXXX...XXXX"
+- foreign_amount: If there's a foreign currency, include amount (as number) and currency code
+- transfer_details: For transfers, include to_account, from_account, and reference
 
-			// Find the index of the similar transaction in our original list
-			for k, origT := range transactions {
-				if origT.Date == similarT.Date && origT.Payee == similarT.Payee && origT.Amount == similarT.Amount {
-					if !used[k] {
-						group.Transactions = append(group.Transactions, similarT)
-						used[k] = true
+Example responses:
+
+Restaurant Purchase:
+{
+  "type": "purchase",
+  "merchant": "Mr. Brojangles",
+  "location": "Bright",
+  "category": "Food & Dining",
+  "description": "Coffee and pastries"
+}
+
+Food Delivery:
+{
+  "type": "purchase",
+  "merchant": "Uber Eats",
+  "category": "Food & Dining",
+  "description": "Food delivery"
+}
+
+Retail Purchase:
+{
+  "type": "purchase",
+  "merchant": "Coles",
+  "location": "Bright",
+  "category": "Groceries",
+  "description": "Grocery shopping"
+}
+
+Foreign Currency Purchase:
+{
+  "type": "purchase",
+  "merchant": "CLOUDFLARE",
+  "category": "Services",
+  "description": "Cloud services",
+  "foreign_amount": {
+    "amount": 5.00,
+    "currency": "USD"
+  }
+}
+
+Transfer:
+{
+  "type": "transfer",
+  "merchant": "John Smith",
+  "category": "Transfers",
+  "description": "Rent payment",
+  "transfer_details": {
+    "to_account": "12345678",
+    "reference": "Rent May 2024"
+  }
+}
+
+Card Purchase:
+{
+  "type": "purchase",
+  "merchant": "Netflix",
+  "category": "Entertainment",
+  "description": "Monthly subscription",
+  "card_number": "4622631234561847"
+}`, t.Payee, t.Amount, t.Date)
+
+	var details *types.TransactionDetails
+	var resp openai.ChatCompletionResponse
+
+	// Retry the OpenAI API call with exponential backoff
+	err := retry.Do(
+		func() error {
+			var err error
+			resp, err = a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+				Model: model,
+				Messages: []openai.ChatCompletionMessage{
+					{
+						Role:    openai.ChatMessageRoleSystem,
+						Content: "You are a financial transaction parser. Classify transactions and extract structured information. Follow the rules strictly, especially about removing payment processor prefixes.",
+					},
+					{
+						Role:    openai.ChatMessageRoleUser,
+						Content: prompt,
+					},
+				},
+				ResponseFormat: &openai.ChatCompletionResponseFormat{
+					Type: openai.ChatCompletionResponseFormatTypeJSONObject,
+				},
+			})
+			if err != nil {
+				// Check if this is a retryable error
+				if openaiErr, ok := err.(*openai.APIError); ok {
+					// Retry on server errors, rate limits, and gateway errors
+					if openaiErr.HTTPStatusCode >= 500 ||
+						openaiErr.HTTPStatusCode == 429 ||
+						openaiErr.HTTPStatusCode == 502 ||
+						openaiErr.HTTPStatusCode == 503 ||
+						openaiErr.HTTPStatusCode == 504 {
+						a.logger.Warn("OpenAI API error, will retry",
+							"status_code", openaiErr.HTTPStatusCode,
+							"error", openaiErr.Message)
+						return err
 					}
-					break
 				}
+				// For other errors, don't retry
+				return retry.Unrecoverable(err)
 			}
-		}
 
-		// Only add groups with more than one transaction
-		if len(group.Transactions) > 1 {
-			// Calculate average similarity
-			var sum float64
-			for _, s := range similarities[1:] { // Skip first similarity as it's 1.0 (self)
-				sum += float64(s)
+			// Validate response
+			if len(resp.Choices) == 0 {
+				return retry.Unrecoverable(fmt.Errorf("no choices in response"))
 			}
-			group.Similarity = sum / float64(len(similarities)-1)
-			groups = append(groups, group)
-		}
 
-		used[i] = true
-	}
+			// Try to unmarshal the response to validate it's valid JSON
+			var testDetails types.TransactionDetails
+			if err := json.Unmarshal([]byte(resp.Choices[0].Message.Content), &testDetails); err != nil {
+				a.logger.Warn("Invalid JSON response, will retry",
+					"error", err,
+					"response", resp.Choices[0].Message.Content)
+				return fmt.Errorf("invalid JSON response: %w", err)
+			}
 
-	return groups, nil
-}
-
-func analyzeGroup(ctx context.Context, client *openai.Client, group TransactionGroup, model string) (string, error) {
-	// Convert group to JSON for the prompt
-	groupJSON, err := json.Marshal(group.Transactions)
-	if err != nil {
-		log.Error("Failed to marshal group", "error", err)
-		return "", fmt.Errorf("error marshaling group: %v", err)
-	}
-
-	log.Debug("Analyzing transaction group", "size", len(group.Transactions), "similarity", group.Similarity)
-
-	prompt := fmt.Sprintf(`Analyze these similar transactions and determine if they are recurring charges.
-Consider:
-1. The frequency of transactions
-2. The consistency of amounts
-3. The similarity of payee names
-
-Transactions:
-%s
-
-Please provide a clear analysis of whether these are recurring charges and explain your reasoning.`, groupJSON)
-
-	resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: model,
-		Messages: []openai.ChatCompletionMessage{
-			{
-				Role:    openai.ChatMessageRoleSystem,
-				Content: "You are a financial analysis assistant. Analyze groups of similar transactions to identify recurring charges.",
-			},
-			{
-				Role:    openai.ChatMessageRoleUser,
-				Content: prompt,
-			},
+			return nil
 		},
-	})
+		retry.Context(ctx),
+		retry.Attempts(3),
+		retry.DelayType(retry.BackOffDelay),
+		retry.OnRetry(func(n uint, err error) {
+			a.logger.Warn("Retrying OpenAI API call",
+				"attempt", n+1,
+				"max_attempts", 3,
+				"error", err,
+				"payee", t.Payee)
+		}),
+	)
+
 	if err != nil {
-		log.Error("Failed to get completion", "error", err)
-		return "", fmt.Errorf("error getting completion: %v", err)
+		return nil, fmt.Errorf("error getting completion: %w", err)
 	}
 
-	log.Debug("Analysis completed for group")
-	return resp.Choices[0].Message.Content, nil
+	details = &types.TransactionDetails{}
+	if err := json.Unmarshal([]byte(resp.Choices[0].Message.Content), details); err != nil {
+		return nil, fmt.Errorf("error unmarshaling response: %w", err)
+	}
+
+	a.logger.Debug("Successfully parsed transaction details",
+		"payee", t.Payee,
+		"type", details.Type,
+		"merchant", details.Merchant,
+		"category", details.Category)
+
+	return details, nil
 }

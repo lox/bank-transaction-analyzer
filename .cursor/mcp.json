@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "ing-transactions": {
+      "command": "./bin/ing-mcp-server"
+    }
+  }
+}

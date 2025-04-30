@@ -43,7 +43,7 @@ func (p *BarProgress) Close() {
 func NewBarProgress(total int) *BarProgress {
 	return &BarProgress{
 		bar: progressbar.NewOptions(total,
-			progressbar.OptionSetDescription("Generating embeddings"),
+			progressbar.OptionSetDescription("Parsing transactions"),
 			progressbar.OptionSetWriter(os.Stderr),
 			progressbar.OptionShowCount(),
 			progressbar.OptionShowIts(),

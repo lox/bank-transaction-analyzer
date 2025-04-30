@@ -1,0 +1,10 @@
+#!/bin/bash
+
+#!/bin/bash
+
+# Get the directory where the script is located
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
+
+# Run the MCP server
+cd "$PROJECT_ROOT" && go run cmd/ing-mcp-server/main.go
