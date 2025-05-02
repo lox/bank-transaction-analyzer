@@ -6,10 +6,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"sync"
 	"time"
 
-	_ "github.com/knaka/go-sqlite3-fts5"
-	_ "github.com/mattn/go-sqlite3"
+	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/ncruces"
+	_ "github.com/ncruces/go-sqlite3"
+	_ "github.com/ncruces/go-sqlite3/driver"
+
 	"github.com/shopspring/decimal"
 
 	"crypto/sha256"
@@ -49,16 +53,18 @@ func New(dataDir string, logger *log.Logger, timezone *time.Location) (*DB, erro
 		return nil, fmt.Errorf("failed to set database pragmas: %v", err)
 	}
 
+	d := &DB{
+		db:       db,
+		logger:   logger,
+		timezone: timezone,
+	}
+
 	// Create tables if they don't exist
 	if err := createTables(db); err != nil {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	return &DB{
-		db:       db,
-		logger:   logger,
-		timezone: timezone,
-	}, nil
+	return d, nil
 }
 
 // createTables creates the necessary tables in the database
@@ -94,6 +100,11 @@ func createTables(db *sql.DB) error {
 			content_rowid='rowid'
 		);
 
+		-- Create virtual table for vector embeddings
+		CREATE VIRTUAL TABLE IF NOT EXISTS transactions_vec USING vec0(
+			embedding FLOAT[768]
+		);
+
 		-- Create trigger to keep FTS table in sync
 		CREATE TRIGGER IF NOT EXISTS transactions_ai AFTER INSERT ON transactions BEGIN
 			INSERT INTO transactions_fts(rowid, search_body) VALUES (new.rowid, new.search_body);
@@ -101,11 +112,13 @@ func createTables(db *sql.DB) error {
 
 		CREATE TRIGGER IF NOT EXISTS transactions_ad AFTER DELETE ON transactions BEGIN
 			INSERT INTO transactions_fts(transactions_fts, rowid, search_body) VALUES('delete', old.rowid, old.search_body);
+			DELETE FROM transactions_vec WHERE rowid = old.rowid;
 		END;
 
 		CREATE TRIGGER IF NOT EXISTS transactions_au AFTER UPDATE ON transactions BEGIN
 			INSERT INTO transactions_fts(transactions_fts, rowid, search_body) VALUES('delete', old.rowid, old.search_body);
 			INSERT INTO transactions_fts(rowid, search_body) VALUES (new.rowid, new.search_body);
+			DELETE FROM transactions_vec WHERE rowid = old.rowid;
 		END;
 	`)
 	if err != nil {
@@ -468,4 +481,436 @@ func (d *DB) SearchTransactions(ctx context.Context, query string, days int) ([]
 	}
 
 	return transactions, nil
+}
+
+// SearchTransactionsByVector searches for transactions using vector similarity
+func (d *DB) SearchTransactionsByVector(ctx context.Context, embedding []byte, days int, limit int) ([]types.TransactionWithDetails, error) {
+	query := `
+		WITH vec_matches AS (
+			SELECT
+				rowid as transaction_id,
+				row_number() OVER (ORDER BY distance) as rank_number,
+				distance
+			FROM transactions_vec
+			WHERE embedding MATCH ? AND k = ?
+			AND rowid IN (
+				SELECT rowid FROM transactions
+				WHERE date >= date('now', ? || ' days')
+			)
+		)
+		SELECT
+			t.date, t.amount, t.payee,
+			t.type, t.merchant, t.location, t.details_category, t.description, t.card_number,
+			t.foreign_amount, t.foreign_currency,
+			t.transfer_to_account, t.transfer_from_account, t.transfer_reference,
+			vm.distance
+		FROM vec_matches vm
+		JOIN transactions t ON t.rowid = vm.transaction_id
+		ORDER BY vm.rank_number ASC
+	`
+
+	rows, err := d.db.QueryContext(ctx, query, embedding, limit, -days)
+	if err != nil {
+		return nil, fmt.Errorf("vector search failed: %w", err)
+	}
+	defer rows.Close()
+
+	var transactions []types.TransactionWithDetails
+	for rows.Next() {
+		var t types.TransactionWithDetails
+		var date time.Time
+		var amount decimal.Decimal
+		var foreignAmount sql.NullFloat64
+		var foreignCurrency sql.NullString
+		var transferToAccount sql.NullString
+		var transferFromAccount sql.NullString
+		var transferReference sql.NullString
+		var distance float64
+
+		if err := rows.Scan(
+			&date, &amount, &t.Payee,
+			&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
+			&foreignAmount, &foreignCurrency,
+			&transferToAccount, &transferFromAccount, &transferReference,
+			&distance,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan transaction: %w", err)
+		}
+
+		// Format date and amount as strings
+		t.Date = date.Format("02/01/2006")
+		t.Amount = amount.String()
+
+		// Set foreign amount if present
+		if foreignAmount.Valid && foreignCurrency.Valid {
+			t.Details.ForeignAmount = &struct {
+				Amount   decimal.Decimal `json:"amount"`
+				Currency string          `json:"currency"`
+			}{
+				Amount:   decimal.NewFromFloat(foreignAmount.Float64),
+				Currency: foreignCurrency.String,
+			}
+		}
+
+		// Set transfer details if present
+		if transferToAccount.Valid || transferFromAccount.Valid || transferReference.Valid {
+			t.Details.TransferDetails = &struct {
+				ToAccount   string `json:"to_account,omitempty"`
+				FromAccount string `json:"from_account,omitempty"`
+				Reference   string `json:"reference,omitempty"`
+			}{
+				ToAccount:   transferToAccount.String,
+				FromAccount: transferFromAccount.String,
+				Reference:   transferReference.String,
+			}
+		}
+
+		transactions = append(transactions, t)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating transactions: %w", err)
+	}
+
+	return transactions, nil
+}
+
+// SearchTransactionsHybrid combines vector and full-text search results using Reciprocal Rank Fusion
+func (d *DB) SearchTransactionsHybrid(ctx context.Context, query string, embedding []byte, days int, limit int) ([]types.TransactionSearchResult, error) {
+	// Constants for RRF algorithm
+	const (
+		rrf_k = 60 // Constant k in RRF formula, typically between 60-80
+		// Weights for different search methods - give more weight to vector search
+		vectorWeight = 2.0 // Increased weight for vector similarity
+		textWeight   = 1.0 // Base weight for text search
+	)
+
+	// Run vector search query
+	vectorQuery := `
+		WITH vec_matches AS (
+			SELECT
+				t.date, t.amount, t.payee,
+				t.type, t.merchant, t.location, t.details_category as category, t.description, t.card_number,
+				t.foreign_amount, t.foreign_currency,
+				t.transfer_to_account, t.transfer_from_account, t.transfer_reference,
+				vm.distance as vector_score,
+				row_number() OVER (ORDER BY vm.distance ASC) as vector_rank
+			FROM transactions t
+			JOIN transactions_vec vm ON t.rowid = vm.rowid
+			WHERE vm.embedding MATCH ? AND k = ?
+			AND t.date >= date('now', ? || ' days')
+			ORDER BY vm.distance ASC
+			LIMIT ?
+		)
+		SELECT * FROM vec_matches
+	`
+
+	// Run text search query with more flexible matching
+	textQuery := `
+		WITH text_matches AS (
+			SELECT
+				t.date, t.amount, t.payee,
+				t.type, t.merchant, t.location, t.details_category as category, t.description, t.card_number,
+				t.foreign_amount, t.foreign_currency,
+				t.transfer_to_account, t.transfer_from_account, t.transfer_reference,
+				rank as text_score,
+				row_number() OVER (ORDER BY rank DESC) as text_rank
+			FROM transactions t
+			JOIN transactions_fts fts ON t.rowid = fts.rowid
+			WHERE fts.search_body MATCH ? || '*'
+			AND t.date >= date('now', ? || ' days')
+			ORDER BY rank DESC
+			LIMIT ?
+		)
+		SELECT * FROM text_matches
+	`
+
+	// Execute both queries in parallel using goroutines
+	var vectorResults, textResults []types.TransactionSearchResult
+	var vectorErr, textErr error
+
+	// Create a wait group for parallel execution
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Run vector search
+	go func() {
+		defer wg.Done()
+		rows, err := d.db.QueryContext(ctx, vectorQuery, embedding, limit, -days, limit)
+		if err != nil {
+			vectorErr = fmt.Errorf("vector search failed: %w", err)
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var result types.TransactionSearchResult
+			var t = &result.TransactionWithDetails
+			var date time.Time
+			var amount decimal.Decimal
+			var foreignAmount sql.NullFloat64
+			var foreignCurrency sql.NullString
+			var transferToAccount sql.NullString
+			var transferFromAccount sql.NullString
+			var transferReference sql.NullString
+			var vectorScore float64
+			var vectorRank int
+
+			if err := rows.Scan(
+				&date,
+				&amount,
+				&t.Payee,
+				&t.Details.Type,
+				&t.Details.Merchant,
+				&t.Details.Location,
+				&t.Details.Category,
+				&t.Details.Description,
+				&t.Details.CardNumber,
+				&foreignAmount,
+				&foreignCurrency,
+				&transferToAccount,
+				&transferFromAccount,
+				&transferReference,
+				&vectorScore,
+				&vectorRank,
+			); err != nil {
+				vectorErr = fmt.Errorf("failed to scan vector result: %w", err)
+				return
+			}
+
+			// Format date and amount
+			t.Date = date.Format("02/01/2006")
+			t.Amount = amount.String()
+
+			// Set foreign amount if present
+			if foreignAmount.Valid && foreignCurrency.Valid {
+				t.Details.ForeignAmount = &struct {
+					Amount   decimal.Decimal `json:"amount"`
+					Currency string          `json:"currency"`
+				}{
+					Amount:   decimal.NewFromFloat(foreignAmount.Float64),
+					Currency: foreignCurrency.String,
+				}
+			}
+
+			// Set transfer details if present
+			if transferToAccount.Valid || transferFromAccount.Valid || transferReference.Valid {
+				t.Details.TransferDetails = &struct {
+					ToAccount   string `json:"to_account,omitempty"`
+					FromAccount string `json:"from_account,omitempty"`
+					Reference   string `json:"reference,omitempty"`
+				}{
+					ToAccount:   transferToAccount.String,
+					FromAccount: transferFromAccount.String,
+					Reference:   transferReference.String,
+				}
+			}
+
+			// Set vector score
+			result.Scores.VectorScore = vectorScore
+
+			vectorResults = append(vectorResults, result)
+		}
+
+		if err := rows.Err(); err != nil {
+			vectorErr = fmt.Errorf("error iterating vector results: %w", err)
+			return
+		}
+	}()
+
+	// Run text search
+	go func() {
+		defer wg.Done()
+		rows, err := d.db.QueryContext(ctx, textQuery, query, -days, limit)
+		if err != nil {
+			textErr = fmt.Errorf("text search failed: %w", err)
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var result types.TransactionSearchResult
+			var t = &result.TransactionWithDetails
+			var date time.Time
+			var amount decimal.Decimal
+			var foreignAmount sql.NullFloat64
+			var foreignCurrency sql.NullString
+			var transferToAccount sql.NullString
+			var transferFromAccount sql.NullString
+			var transferReference sql.NullString
+			var textScore float64
+			var textRank int
+
+			if err := rows.Scan(
+				&result.Transaction.Date,
+				&amount,
+				&t.Payee,
+				&t.Details.Type,
+				&t.Details.Merchant,
+				&t.Details.Location,
+				&t.Details.Category,
+				&t.Details.Description,
+				&t.Details.CardNumber,
+				&foreignAmount,
+				&foreignCurrency,
+				&transferToAccount,
+				&transferFromAccount,
+				&transferReference,
+				&textScore,
+				&textRank,
+			); err != nil {
+				textErr = fmt.Errorf("failed to scan text result: %w", err)
+				return
+			}
+
+			// Format date and amount
+			t.Date = date.Format("02/01/2006")
+			t.Amount = amount.String()
+
+			// Set foreign amount if present
+			if foreignAmount.Valid && foreignCurrency.Valid {
+				t.Details.ForeignAmount = &struct {
+					Amount   decimal.Decimal `json:"amount"`
+					Currency string          `json:"currency"`
+				}{
+					Amount:   decimal.NewFromFloat(foreignAmount.Float64),
+					Currency: foreignCurrency.String,
+				}
+			}
+
+			// Set transfer details if present
+			if transferToAccount.Valid || transferFromAccount.Valid || transferReference.Valid {
+				t.Details.TransferDetails = &struct {
+					ToAccount   string `json:"to_account,omitempty"`
+					FromAccount string `json:"from_account,omitempty"`
+					Reference   string `json:"reference,omitempty"`
+				}{
+					ToAccount:   transferToAccount.String,
+					FromAccount: transferFromAccount.String,
+					Reference:   transferReference.String,
+				}
+			}
+
+			// Set text score
+			result.Scores.TextScore = textScore
+
+			textResults = append(textResults, result)
+		}
+
+		if err := rows.Err(); err != nil {
+			textErr = fmt.Errorf("error iterating text results: %w", err)
+			return
+		}
+	}()
+
+	// Wait for both searches to complete
+	wg.Wait()
+
+	// Check for errors
+	if vectorErr != nil {
+		return nil, vectorErr
+	}
+	if textErr != nil {
+		return nil, textErr
+	}
+
+	// Combine results using RRF
+	transactionScores := make(map[string]*types.TransactionSearchResult)
+
+	// Process vector results
+	for _, result := range vectorResults {
+		id := generateTransactionID(result.Transaction)
+		if _, exists := transactionScores[id]; !exists {
+			transactionScores[id] = &result
+		}
+	}
+
+	// Process text results
+	for _, result := range textResults {
+		id := generateTransactionID(result.Transaction)
+		if existing, exists := transactionScores[id]; exists {
+			// Merge scores
+			existing.Scores.TextScore = result.Scores.TextScore
+		} else {
+			transactionScores[id] = &result
+		}
+	}
+
+	// Calculate RRF scores
+	var combinedResults []types.TransactionSearchResult
+	for _, result := range transactionScores {
+		// Calculate RRF score using both vector and text scores
+		vectorRRF := vectorWeight / (float64(rrf_k) + result.Scores.VectorScore)
+		textRRF := textWeight / (float64(rrf_k) + result.Scores.TextScore)
+
+		// Combine scores with adjusted weights
+		result.Scores.RRFScore = vectorRRF + textRRF
+		combinedResults = append(combinedResults, *result)
+	}
+
+	// Sort by RRF score
+	sort.Slice(combinedResults, func(i, j int) bool {
+		return combinedResults[i].Scores.RRFScore > combinedResults[j].Scores.RRFScore
+	})
+
+	// Limit results
+	if len(combinedResults) > limit {
+		combinedResults = combinedResults[:limit]
+	}
+
+	return combinedResults, nil
+}
+
+// SerializeEmbedding serializes a float32 vector for sqlite-vec
+func (d *DB) SerializeEmbedding(embedding []float32) ([]byte, error) {
+	serialized, err := sqlite_vec.SerializeFloat32(embedding)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize embedding: %w", err)
+	}
+	return serialized, nil
+}
+
+// DB returns the underlying database connection
+func (d *DB) DB() *sql.DB {
+	return d.db
+}
+
+// CategoryCount represents a category and its transaction count
+type CategoryCount struct {
+	Category string
+	Count    int
+}
+
+// GetCategories returns all unique categories and their counts from the last N days
+func (d *DB) GetCategories(ctx context.Context, days int) ([]CategoryCount, error) {
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT
+			details_category as category,
+			COUNT(*) as count
+		FROM transactions
+		WHERE date >= date('now', ? || ' days')
+		AND details_category IS NOT NULL
+		AND details_category != ''
+		GROUP BY details_category
+		ORDER BY count DESC, category ASC
+	`, -days)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query categories: %w", err)
+	}
+	defer rows.Close()
+
+	var categories []CategoryCount
+	for rows.Next() {
+		var cat CategoryCount
+		if err := rows.Scan(&cat.Category, &cat.Count); err != nil {
+			return nil, fmt.Errorf("failed to scan category row: %w", err)
+		}
+		categories = append(categories, cat)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating categories: %w", err)
+	}
+
+	return categories, nil
 }

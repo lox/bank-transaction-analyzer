@@ -2,6 +2,8 @@ package analyzer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,9 +23,10 @@ type Config struct {
 }
 
 type Analyzer struct {
-	client *openai.Client
-	logger *log.Logger
-	db     *db.DB
+	client     *openai.Client
+	logger     *log.Logger
+	db         *db.DB
+	embeddings EmbeddingProvider
 }
 
 type AnalyzedTransaction struct {
@@ -32,12 +35,20 @@ type AnalyzedTransaction struct {
 }
 
 // NewAnalyzer creates a new transaction parser
-func NewAnalyzer(client *openai.Client, logger *log.Logger, db *db.DB) *Analyzer {
-	return &Analyzer{
-		client: client,
-		logger: logger,
-		db:     db,
+func NewAnalyzer(client *openai.Client, logger *log.Logger, db *db.DB) (*Analyzer, error) {
+	// Create embedding provider
+	config := NewLlamaCppConfig().WithLogger(logger)
+	embeddings, err := NewLlamaCppEmbeddingProvider(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create embedding provider: %w", err)
 	}
+
+	return &Analyzer{
+		client:     client,
+		logger:     logger,
+		db:         db,
+		embeddings: embeddings,
+	}, nil
 }
 
 // AnalyzeTransactions processes transactions in parallel and stores their details
@@ -107,7 +118,7 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 			})
 
 			// Store transaction details
-			if err := a.db.Store(gCtx, t, details); err != nil {
+			if err := a.storeWithEmbedding(gCtx, t, details); err != nil {
 				// If context was canceled, return immediately
 				if errors.Is(err, context.Canceled) {
 					return err
@@ -143,11 +154,43 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 
 // analyzeTransaction uses an LLM to extract structured information from a transaction
 func (a *Analyzer) analyzeTransaction(ctx context.Context, t types.Transaction, model string) (*types.TransactionDetails, error) {
-	a.logger.Debug("Analyzing transaction",
+	a.logger.Info("Analyzing transaction",
 		"payee", t.Payee,
 		"amount", t.Amount,
 		"date", t.Date,
 		"model", model)
+
+	// First, generate an embedding for the transaction text
+	searchText := fmt.Sprintf("%s %s", t.Payee, t.Amount)
+	a.logger.Debug("Generating embedding for transaction",
+		"search_text", searchText)
+
+	embedding, err := a.embeddings.GenerateEmbedding(ctx, searchText)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate embedding: %w", err)
+	}
+
+	// Find similar transactions
+	similarTransactions, err := a.findSimilarTransactions(ctx, embedding, 0.8)
+	if err != nil {
+		a.logger.Warn("Failed to find similar transactions",
+			"error", err,
+			"payee", t.Payee)
+		// Continue with analysis even if finding similar transactions fails
+	}
+
+	// Get the most common merchant name from similar transactions
+	consistentMerchant := a.findConsistentMerchantName(similarTransactions)
+
+	// Log whether we'll use a consistent merchant name
+	if consistentMerchant != "" {
+		a.logger.Info("Using consistent merchant name for analysis",
+			"payee", t.Payee,
+			"consistent_merchant", consistentMerchant)
+	} else {
+		a.logger.Debug("No consistent merchant name found",
+			"payee", t.Payee)
+	}
 
 	prompt := fmt.Sprintf(`Extract structured information from this transaction description.
 Classify the transaction type and extract relevant details.
@@ -186,6 +229,9 @@ IMPORTANT RULES:
    - Remove any domain names (e.g., .com, .co)
    - Remove any help/support text
    - Use the main brand name only
+   - Use proper case formatting (e.g., "Richie's Cafe" not "RICHIES CAFE")
+   - For chains, use their official capitalization (e.g., "McDonald's" not "MCDONALDS")
+   - For local businesses, use title case with appropriate apostrophes%s
 7. Description field rules:
    - NEVER include the amount in the description
    - Provide a brief description of what was purchased
@@ -211,80 +257,21 @@ Return the information in JSON format with these fields:
 - card_number: The full card number if present in the format "Card XXXX...XXXX"
 - foreign_amount: If there's a foreign currency, include amount (as number) and currency code
 - transfer_details: For transfers, include to_account, from_account, and reference
-- search_body: A concatenated string of all relevant searchable information, including merchant, location, description, and any other relevant details. This should be a single string that can be used for full-text search.
-
-Example responses:
-
-Restaurant Purchase:
-{
-  "type": "purchase",
-  "merchant": "Mr. Brojangles",
-  "location": "Bright",
-  "category": "Food & Dining",
-  "description": "Coffee and pastries",
-  "search_body": "Mr. Brojangles Bright Coffee and pastries Food & Dining"
-}
-
-Food Delivery:
-{
-  "type": "purchase",
-  "merchant": "Uber Eats",
-  "category": "Food & Dining",
-  "description": "Food delivery",
-  "search_body": "Uber Eats Food delivery Food & Dining"
-}
-
-Retail Purchase:
-{
-  "type": "purchase",
-  "merchant": "Coles",
-  "location": "Bright",
-  "category": "Groceries",
-  "description": "Grocery shopping",
-  "search_body": "Coles Bright Grocery shopping Groceries"
-}
-
-Foreign Currency Purchase:
-{
-  "type": "purchase",
-  "merchant": "CLOUDFLARE",
-  "category": "Services",
-  "description": "Cloud services",
-  "foreign_amount": {
-    "amount": 5.00,
-    "currency": "USD"
-  },
-  "search_body": "CLOUDFLARE Cloud services Services USD"
-}
-
-Transfer:
-{
-  "type": "transfer",
-  "merchant": "John Smith",
-  "category": "Transfers",
-  "description": "Rent payment",
-  "transfer_details": {
-    "to_account": "12345678",
-    "reference": "Rent May 2024"
-  },
-  "search_body": "John Smith Rent payment Transfers 12345678 Rent May 2024"
-}
-
-Card Purchase:
-{
-  "type": "purchase",
-  "merchant": "Netflix",
-  "category": "Entertainment",
-  "description": "Monthly subscription",
-  "card_number": "4622631234561847",
-  "search_body": "Netflix Monthly subscription Entertainment 4622631234561847"
-}`, t.Payee, t.Amount, t.Date)
+- search_body: A concatenated string of all relevant searchable information, including merchant, location, description, and any other relevant details. This should be a single string that can be used for full-text search.`,
+		// Add consistent merchant name hint if available
+		func() string {
+			if consistentMerchant != "" {
+				return fmt.Sprintf("\n   - If this appears to be from the same merchant as '%s', use that exact name", consistentMerchant)
+			}
+			return ""
+		}(),
+		t.Payee, t.Amount, t.Date)
 
 	var details *types.TransactionDetails
 	var resp openai.ChatCompletionResponse
 
 	// Retry the OpenAI API call with exponential backoff
-	err := retry.Do(
+	err = retry.Do(
 		func() error {
 			var err error
 			resp, err = a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
@@ -359,11 +346,175 @@ Card Purchase:
 		return nil, fmt.Errorf("error unmarshaling response: %w", err)
 	}
 
-	a.logger.Debug("Successfully parsed transaction details",
+	// Log whether the consistent merchant name was used
+	if consistentMerchant != "" {
+		if details.Merchant == consistentMerchant {
+			a.logger.Info("Used consistent merchant name",
+				"payee", t.Payee,
+				"merchant", details.Merchant)
+		} else {
+			a.logger.Info("Different merchant name used despite suggestion",
+				"payee", t.Payee,
+				"suggested_merchant", consistentMerchant,
+				"used_merchant", details.Merchant)
+		}
+	}
+
+	a.logger.Info("Successfully parsed transaction details",
 		"payee", t.Payee,
 		"type", details.Type,
 		"merchant", details.Merchant,
-		"category", details.Category)
+		"category", details.Category,
+		"similar_merchant_found", consistentMerchant != "")
 
 	return details, nil
+}
+
+// generateTransactionID creates a unique ID for a transaction based on payee, amount, and date
+func generateTransactionID(t types.Transaction) string {
+	// Create a hash of the transaction details
+	h := sha256.New()
+	h.Write([]byte(fmt.Sprintf("%s|%s|%s", t.Payee, t.Amount, t.Date)))
+	return hex.EncodeToString(h.Sum(nil))[:8]
+}
+
+// Store stores a transaction and its details in the database
+func (a *Analyzer) storeWithEmbedding(ctx context.Context, t types.Transaction, details *types.TransactionDetails) error {
+	// Generate embedding for the search body
+	embedding, err := a.embeddings.GenerateEmbedding(ctx, details.SearchBody)
+	if err != nil {
+		return fmt.Errorf("failed to generate embedding: %w", err)
+	}
+
+	// Serialize the embedding for sqlite-vec
+	serializedEmbedding, err := a.db.SerializeEmbedding(embedding)
+	if err != nil {
+		return fmt.Errorf("failed to serialize embedding: %w", err)
+	}
+
+	// Begin transaction
+	tx, err := a.db.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Store transaction details
+	if err := a.db.Store(ctx, t, details); err != nil {
+		return fmt.Errorf("failed to store transaction: %w", err)
+	}
+
+	// Get the rowid of the inserted transaction
+	var rowid int64
+	err = tx.QueryRowContext(ctx, `SELECT rowid FROM transactions WHERE id = ?`, generateTransactionID(t)).Scan(&rowid)
+	if err != nil {
+		return fmt.Errorf("failed to get transaction rowid: %w", err)
+	}
+
+	// Store embedding
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO transactions_vec(rowid, embedding)
+		VALUES (?, ?)
+	`, rowid, serializedEmbedding)
+	if err != nil {
+		return fmt.Errorf("failed to store embedding: %w", err)
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// SearchTransactionsBySemanticSimilarity searches for transactions similar to the given query
+func (a *Analyzer) SearchTransactionsBySemanticSimilarity(ctx context.Context, query string, days int, limit int) ([]types.TransactionWithDetails, error) {
+	// Generate embedding for the query
+	embedding, err := a.embeddings.GenerateEmbedding(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate embedding: %w", err)
+	}
+
+	// Serialize the embedding for sqlite-vec
+	serializedEmbedding, err := a.db.SerializeEmbedding(embedding)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize embedding: %w", err)
+	}
+
+	// Search transactions using vector similarity
+	return a.db.SearchTransactionsByVector(ctx, serializedEmbedding, days, limit)
+}
+
+// findSimilarTransactions finds transactions with similar embeddings
+func (a *Analyzer) findSimilarTransactions(ctx context.Context, embedding []float32, threshold float64) ([]types.TransactionWithDetails, error) {
+	// Serialize the embedding for sqlite-vec
+	serializedEmbedding, err := a.db.SerializeEmbedding(embedding)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize embedding: %w", err)
+	}
+
+	// Search for similar transactions, limiting to 10 results from the last year
+	transactions, err := a.db.SearchTransactionsByVector(ctx, serializedEmbedding, 365, 10)
+	if err != nil {
+		return nil, err
+	}
+
+	a.logger.Debug("Found similar transactions",
+		"count", len(transactions),
+		"transactions", func() []string {
+			var details []string
+			for _, t := range transactions {
+				details = append(details, fmt.Sprintf("%s (%s)", t.Details.Merchant, t.Date))
+			}
+			return details
+		}())
+
+	return transactions, nil
+}
+
+// findConsistentMerchantName analyzes similar transactions to find the most common merchant name
+func (a *Analyzer) findConsistentMerchantName(transactions []types.TransactionWithDetails) string {
+	if len(transactions) == 0 {
+		a.logger.Debug("No similar transactions found for merchant name consistency")
+		return ""
+	}
+
+	// Count merchant name occurrences
+	merchantCounts := make(map[string]int)
+	for _, t := range transactions {
+		if t.Details.Merchant != "" {
+			merchantCounts[t.Details.Merchant]++
+		}
+	}
+
+	// Log merchant counts
+	a.logger.Debug("Merchant name counts from similar transactions",
+		"counts", func() map[string]int {
+			// Create a copy of the map to avoid modifying the original
+			counts := make(map[string]int)
+			for k, v := range merchantCounts {
+				counts[k] = v
+			}
+			return counts
+		}())
+
+	// Find the most common merchant name
+	var mostCommon string
+	var maxCount int
+	for merchant, count := range merchantCounts {
+		if count > maxCount {
+			maxCount = count
+			mostCommon = merchant
+		}
+	}
+
+	if mostCommon != "" {
+		a.logger.Info("Selected consistent merchant name",
+			"merchant", mostCommon,
+			"occurrences", maxCount,
+			"total_similar", len(transactions))
+	}
+
+	return mostCommon
 }

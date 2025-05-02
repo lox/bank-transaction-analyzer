@@ -19,7 +19,7 @@ type GlobalFlags struct {
 	DataDir     string `help:"Path to data directory" default:"./data"`
 	OpenAIKey   string `help:"OpenAI API key" env:"OPENAI_API_KEY" required:""`
 	OpenAIModel string `help:"OpenAI model to use for analysis" default:"gpt-4.1" env:"OPENAI_MODEL"`
-	Concurrency int    `help:"Number of concurrent transactions to process" default:"10"`
+	Concurrency int    `help:"Number of concurrent transactions to process" default:"3"`
 	Verbose     bool   `help:"Enable verbose logging" default:"false" short:"v"`
 	Timezone    string `help:"Timezone to use for transaction dates" required:"" default:"Australia/Melbourne"`
 }
@@ -72,7 +72,12 @@ func (c *CLI) Run() error {
 	defer cancel()
 
 	// Analyze transactions
-	_, err = analyzer.NewAnalyzer(client, logger, database).AnalyzeTransactions(processCtx, transactions, analyzer.Config{
+	an, err := analyzer.NewAnalyzer(client, logger, database)
+	if err != nil {
+		logger.Fatal("Failed to create analyzer", "error", err)
+	}
+
+	_, err = an.AnalyzeTransactions(processCtx, transactions, analyzer.Config{
 		Model:       c.OpenAIModel,
 		Concurrency: c.Concurrency,
 		Progress:    !c.Verbose,
