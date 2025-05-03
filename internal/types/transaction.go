@@ -15,26 +15,30 @@ const (
 	TransactionTypeInterest   TransactionType = "interest"
 )
 
-// Transaction represents a generic transaction, independent of the input format
+// Transaction represents a bank transaction
 type Transaction struct {
-	Date   string
-	Amount string
-	Payee  string
+	Date   string `json:"date"`
+	Amount string `json:"amount"`
+	Payee  string `json:"payee"`
+	Bank   string `json:"bank"`
 }
 
 // TransactionDetails contains structured information extracted from a transaction
 type TransactionDetails struct {
-	Type          TransactionType `json:"type"`
-	Merchant      string          `json:"merchant"`
-	Location      string          `json:"location,omitempty"`
-	Category      string          `json:"category,omitempty"`
-	Description   string          `json:"description,omitempty"`
-	CardNumber    string          `json:"card_number,omitempty"`
-	SearchBody    string          `json:"search_body,omitempty"`
+	Type        string `json:"type"`
+	Merchant    string `json:"merchant"`
+	Location    string `json:"location"`
+	Category    string `json:"category"`
+	Description string `json:"description"`
+	CardNumber  string `json:"card_number"`
+	SearchBody  string `json:"search_body"`
+
+	// Optional fields
 	ForeignAmount *struct {
 		Amount   decimal.Decimal `json:"amount"`
 		Currency string          `json:"currency"`
 	} `json:"foreign_amount,omitempty"`
+
 	TransferDetails *struct {
 		ToAccount   string `json:"to_account,omitempty"`
 		FromAccount string `json:"from_account,omitempty"`
@@ -44,5 +48,5 @@ type TransactionDetails struct {
 
 type TransactionWithDetails struct {
 	Transaction
-	Details TransactionDetails
+	Details TransactionDetails `json:"details"`
 }

@@ -20,7 +20,7 @@ import (
 	"encoding/hex"
 
 	"github.com/charmbracelet/log"
-	"github.com/lox/ing-transaction-analyzer/internal/types"
+	"github.com/lox/bank-transaction-analyzer/internal/types"
 )
 
 // DB represents a SQLite database connection
@@ -76,6 +76,7 @@ func createTables(db *sql.DB) error {
 			date DATE NOT NULL,
 			amount DECIMAL(15,2) NOT NULL,
 			payee TEXT NOT NULL,
+			bank TEXT NOT NULL,
 			-- Transaction details
 			type TEXT NOT NULL,
 			merchant TEXT NOT NULL,
@@ -111,15 +112,21 @@ func createTables(db *sql.DB) error {
 		END;
 
 		CREATE TRIGGER IF NOT EXISTS transactions_ad AFTER DELETE ON transactions BEGIN
-			INSERT INTO transactions_fts(transactions_fts, rowid, search_body) VALUES('delete', old.rowid, old.search_body);
+			DELETE FROM transactions_fts WHERE rowid = old.rowid;
 			DELETE FROM transactions_vec WHERE rowid = old.rowid;
 		END;
 
 		CREATE TRIGGER IF NOT EXISTS transactions_au AFTER UPDATE ON transactions BEGIN
-			INSERT INTO transactions_fts(transactions_fts, rowid, search_body) VALUES('delete', old.rowid, old.search_body);
-			INSERT INTO transactions_fts(rowid, search_body) VALUES (new.rowid, new.search_body);
+			DELETE FROM transactions_fts WHERE rowid = old.rowid;
 			DELETE FROM transactions_vec WHERE rowid = old.rowid;
+			INSERT INTO transactions_fts(rowid, search_body) VALUES (new.rowid, new.search_body);
 		END;
+
+		-- Create a view to help debug FTS issues
+		CREATE VIEW IF NOT EXISTS transactions_with_fts AS
+		SELECT t.rowid, t.id, t.search_body, fts.rowid as fts_rowid
+		FROM transactions t
+		LEFT JOIN transactions_fts fts ON t.rowid = fts.rowid;
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to create transactions table: %v", err)
@@ -133,6 +140,7 @@ func createTables(db *sql.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_transactions_merchant ON transactions(merchant)",
 		"CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(details_category)",
 		"CREATE INDEX IF NOT EXISTS idx_transactions_amount ON transactions(amount)",
+		"CREATE INDEX IF NOT EXISTS idx_transactions_bank ON transactions(bank)",
 	}
 
 	for _, index := range indexes {
@@ -148,6 +156,7 @@ func createTables(db *sql.DB) error {
 func (d *DB) Store(ctx context.Context, t types.Transaction, details *types.TransactionDetails) error {
 	// Generate transaction ID
 	id := generateTransactionID(t)
+	d.logger.Debug("Storing transaction", "id", id, "date", t.Date, "amount", t.Amount, "bank", t.Bank, "payee", t.Payee)
 
 	// Parse date from QIF format
 	date, dateErr := time.ParseInLocation("02/01/2006", t.Date, d.timezone)
@@ -156,15 +165,15 @@ func (d *DB) Store(ctx context.Context, t types.Transaction, details *types.Tran
 	}
 
 	// Insert or replace transaction
-	_, err := d.db.ExecContext(ctx, `
+	result, err := d.db.ExecContext(ctx, `
 		INSERT OR REPLACE INTO transactions (
-			id, date, amount, payee,
+			id, date, amount, payee, bank,
 			type, merchant, location, details_category, description, card_number, search_body,
 			foreign_amount, foreign_currency,
 			transfer_to_account, transfer_from_account, transfer_reference
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		id, date, t.Amount, t.Payee,
+		id, date, t.Amount, t.Payee, t.Bank,
 		details.Type, details.Merchant, details.Location, details.Category, details.Description, details.CardNumber, details.SearchBody,
 		getForeignAmount(details), getForeignCurrency(details),
 		getTransferToAccount(details), getTransferFromAccount(details), getTransferReference(details),
@@ -173,7 +182,32 @@ func (d *DB) Store(ctx context.Context, t types.Transaction, details *types.Tran
 		return fmt.Errorf("failed to store transaction: %v", err)
 	}
 
-	d.logger.Debug("Stored transaction", "id", id, "date", t.Date, "amount", t.Amount)
+	// Log the result of the insert/replace
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		d.logger.Warn("Failed to get rows affected", "error", err)
+	} else {
+		d.logger.Debug("Transaction stored", "id", id, "rows_affected", rowsAffected)
+	}
+
+	// Try to get the rowid after insert
+	var rowid int64
+	err = d.db.QueryRowContext(ctx, "SELECT rowid FROM transactions WHERE id = ?", id).Scan(&rowid)
+	if err != nil {
+		d.logger.Error("Failed to get rowid after insert", "id", id, "error", err)
+		return fmt.Errorf("failed to get transaction rowid: %v", err)
+	}
+	d.logger.Debug("Got rowid after insert", "id", id, "rowid", rowid)
+
+	// Check FTS status
+	var ftsRowid sql.NullInt64
+	err = d.db.QueryRowContext(ctx, "SELECT fts_rowid FROM transactions_with_fts WHERE id = ?", id).Scan(&ftsRowid)
+	if err != nil {
+		d.logger.Warn("Failed to check FTS status", "id", id, "error", err)
+	} else {
+		d.logger.Debug("FTS status", "id", id, "fts_rowid", ftsRowid)
+	}
+
 	return nil
 }
 
@@ -184,6 +218,7 @@ func (d *DB) Get(ctx context.Context, t types.Transaction) (*types.TransactionDe
 	var details types.TransactionDetails
 	var date time.Time
 	var amount decimal.Decimal
+	var bank string
 	var foreignAmount sql.NullFloat64
 	var foreignCurrency sql.NullString
 	var transferToAccount sql.NullString
@@ -191,12 +226,12 @@ func (d *DB) Get(ctx context.Context, t types.Transaction) (*types.TransactionDe
 	var transferReference sql.NullString
 
 	err := d.db.QueryRowContext(ctx, `
-		SELECT date, amount, type, merchant, location, details_category, description, card_number, search_body,
+		SELECT date, amount, bank, type, merchant, location, details_category, description, card_number, search_body,
 			foreign_amount, foreign_currency,
 			transfer_to_account, transfer_from_account, transfer_reference
 		FROM transactions WHERE id = ?
 	`, id).Scan(
-		&date, &amount, &details.Type, &details.Merchant, &details.Location, &details.Category, &details.Description, &details.CardNumber, &details.SearchBody,
+		&date, &amount, &bank, &details.Type, &details.Merchant, &details.Location, &details.Category, &details.Description, &details.CardNumber, &details.SearchBody,
 		&foreignAmount, &foreignCurrency,
 		&transferToAccount, &transferFromAccount, &transferReference,
 	)
@@ -238,7 +273,7 @@ func (d *DB) Get(ctx context.Context, t types.Transaction) (*types.TransactionDe
 func generateTransactionID(t types.Transaction) string {
 	// Create a hash of the transaction details
 	h := sha256.New()
-	h.Write([]byte(fmt.Sprintf("%s|%s|%s", t.Payee, t.Amount, t.Date)))
+	h.Write([]byte(fmt.Sprintf("%s|%s|%s|%s", t.Payee, t.Amount, t.Date, t.Bank)))
 	return hex.EncodeToString(h.Sum(nil))[:8]
 }
 
@@ -332,7 +367,7 @@ func (d *DB) Close() error {
 // GetTransactions returns transactions with details from the last N days
 func (d *DB) GetTransactions(ctx context.Context, days int) ([]types.TransactionWithDetails, error) {
 	query := `
-		SELECT t.date, t.amount, t.payee,
+		SELECT t.date, t.amount, t.payee, t.bank,
 			t.type, t.merchant, t.location, t.details_category, t.description, t.card_number,
 			t.foreign_amount, t.foreign_currency,
 			t.transfer_to_account, t.transfer_from_account, t.transfer_reference
@@ -359,7 +394,7 @@ func (d *DB) GetTransactions(ctx context.Context, days int) ([]types.Transaction
 		var transferReference sql.NullString
 
 		if err := rows.Scan(
-			&date, &amount, &t.Payee,
+			&date, &amount, &t.Payee, &t.Bank,
 			&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
 			&foreignAmount, &foreignCurrency,
 			&transferToAccount, &transferFromAccount, &transferReference,
@@ -408,7 +443,7 @@ func (d *DB) GetTransactions(ctx context.Context, days int) ([]types.Transaction
 // SearchTransactions searches for transactions using full-text search
 func (d *DB) SearchTransactions(ctx context.Context, query string, days int) ([]types.TransactionWithDetails, error) {
 	searchQuery := `
-		SELECT t.date, t.amount, t.payee,
+		SELECT t.date, t.amount, t.payee, t.bank,
 			t.type, t.merchant, t.location, t.details_category, t.description, t.card_number,
 			t.foreign_amount, t.foreign_currency,
 			t.transfer_to_account, t.transfer_from_account, t.transfer_reference
@@ -437,7 +472,7 @@ func (d *DB) SearchTransactions(ctx context.Context, query string, days int) ([]
 		var transferReference sql.NullString
 
 		if err := rows.Scan(
-			&date, &amount, &t.Payee,
+			&date, &amount, &t.Payee, &t.Bank,
 			&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
 			&foreignAmount, &foreignCurrency,
 			&transferToAccount, &transferFromAccount, &transferReference,

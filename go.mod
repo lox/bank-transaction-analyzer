@@ -1,4 +1,4 @@
-module github.com/lox/ing-transaction-analyzer
+module github.com/lox/bank-transaction-analyzer
 
 go 1.24
 

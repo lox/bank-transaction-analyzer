@@ -1,13 +1,13 @@
-# ING Transaction Analyzer
+# Bank Transaction Analyzer
 
-A tool for analyzing ING bank transactions using GPT-4.1 to extract structured information from transaction descriptions. The main interface is through an MCP server that provides programmatic access to your transaction data via the Model Context Protocol.
+A tool for analyzing bank transactions using GPT-4.1 to extract structured information from transaction descriptions. The main interface is through an MCP server that provides programmatic access to your transaction data via the Model Context Protocol.
 
 ## Quick Start
 
 ### Installation
 
 ```bash
-go install github.com/lox/ing-transaction-analyzer/cmd/ing-mcp-server@latest
+go install github.com/lox/bank-transaction-analyzer/cmd/ing-mcp-server@latest
 ```
 
 ### Configuration
@@ -54,8 +54,8 @@ export OPENAI_API_KEY=your-api-key
 2. Run the analyzer:
 
 ```bash
-go install github.com/lox/ing-transaction-analyzer/cmd/ing-transaction-analyzer@latest
-ing-transaction-analyzer --qif-file Transactions.qif
+go install github.com/lox/bank-transaction-analyzer/cmd/bank-transaction-analyzer@latest
+bank-transaction-analyzer --qif-file Transactions.qif
 ```
 
 ### Options
@@ -144,7 +144,7 @@ This lets you chat with the data.
 #### Installation
 
 ```bash
-go install github.com/lox/ing-transaction-analyzer/cmd/ing-mcp-server@latest
+go install github.com/lox/bank-transaction-analyzer/cmd/ing-mcp-server@latest
 ```
 
 #### Configuring with Cursor
@@ -212,9 +212,9 @@ export OPENAI_API_KEY=your-api-key
 To build from source:
 
 ```bash
-git clone https://github.com/lox/ing-transaction-analyzer
-cd ing-transaction-analyzer
-go build -o ing-transaction-analyzer ./cmd/ing-transaction-analyzer
+git clone https://github.com/lox/bank-transaction-analyzer
+cd bank-transaction-analyzer
+go build -o bank-transaction-analyzer ./cmd/bank-transaction-analyzer
 go build -o ing-mcp-server ./cmd/ing-mcp-server
 ```
 

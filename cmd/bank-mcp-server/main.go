@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/lox/ing-transaction-analyzer/internal/mcp"
+	"github.com/lox/bank-transaction-analyzer/internal/mcp"
 )
 
 func main() {

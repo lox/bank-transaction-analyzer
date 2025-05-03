@@ -3,18 +3,57 @@ package analyzer
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/avast/retry-go/v4"
 	"github.com/charmbracelet/log"
-	"github.com/lox/ing-transaction-analyzer/internal/db"
-	"github.com/lox/ing-transaction-analyzer/internal/types"
+	"github.com/lox/bank-transaction-analyzer/internal/db"
+	"github.com/lox/bank-transaction-analyzer/internal/types"
 	"github.com/sashabaranov/go-openai"
 	"golang.org/x/sync/errgroup"
 )
+
+// Helper functions to safely extract values from transaction details
+func getForeignAmount(details *types.TransactionDetails) sql.NullFloat64 {
+	if details.ForeignAmount != nil {
+		amount, _ := details.ForeignAmount.Amount.Float64()
+		return sql.NullFloat64{Float64: amount, Valid: true}
+	}
+	return sql.NullFloat64{}
+}
+
+func getForeignCurrency(details *types.TransactionDetails) sql.NullString {
+	if details.ForeignAmount != nil {
+		return sql.NullString{String: details.ForeignAmount.Currency, Valid: true}
+	}
+	return sql.NullString{}
+}
+
+func getTransferToAccount(details *types.TransactionDetails) sql.NullString {
+	if details.TransferDetails != nil {
+		return sql.NullString{String: details.TransferDetails.ToAccount, Valid: true}
+	}
+	return sql.NullString{}
+}
+
+func getTransferFromAccount(details *types.TransactionDetails) sql.NullString {
+	if details.TransferDetails != nil {
+		return sql.NullString{String: details.TransferDetails.FromAccount, Valid: true}
+	}
+	return sql.NullString{}
+}
+
+func getTransferReference(details *types.TransactionDetails) sql.NullString {
+	if details.TransferDetails != nil {
+		return sql.NullString{String: details.TransferDetails.Reference, Valid: true}
+	}
+	return sql.NullString{}
+}
 
 type Config struct {
 	Model       string
@@ -53,11 +92,19 @@ func NewAnalyzer(client *openai.Client, logger *log.Logger, db *db.DB) (*Analyze
 
 // AnalyzeTransactions processes transactions in parallel and stores their details
 func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types.Transaction, config Config) ([]AnalyzedTransaction, error) {
+	startTime := time.Now()
+	a.logger.Info("Starting transaction analysis", "total_transactions", len(transactions))
+
 	// Filter out transactions that already exist in the database
+	filterStart := time.Now()
 	filteredTransactions, err := a.db.FilterExistingTransactions(ctx, transactions)
 	if err != nil {
 		return nil, fmt.Errorf("error filtering existing transactions: %w", err)
 	}
+	a.logger.Info("Filtered existing transactions",
+		"duration", time.Since(filterStart),
+		"total", len(filteredTransactions),
+		"skipped", len(transactions)-len(filteredTransactions))
 
 	// Create progress bar
 	var progress Progress
@@ -66,8 +113,6 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 	} else {
 		progress = NewBarProgress(len(filteredTransactions))
 	}
-
-	a.logger.Info("Analyzing transactions", "total", len(filteredTransactions), "skipped", len(transactions)-len(filteredTransactions))
 
 	analyzedTransactions := make([]AnalyzedTransaction, len(transactions))
 
@@ -100,6 +145,7 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 			}
 
 			// Parse transaction details
+			analysisStart := time.Now()
 			details, err := a.analyzeTransaction(gCtx, t, config.Model)
 			if err != nil {
 				// If context was canceled, return immediately
@@ -108,9 +154,13 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 				}
 				a.logger.Error("Failed to analyze transaction",
 					"error", err,
-					"payee", t.Payee)
+					"payee", t.Payee,
+					"duration", time.Since(analysisStart))
 				return fmt.Errorf("error analyzing transaction: %w", err)
 			}
+			a.logger.Debug("Transaction analysis completed",
+				"payee", t.Payee,
+				"duration", time.Since(analysisStart))
 
 			analyzedTransactions = append(analyzedTransactions, AnalyzedTransaction{
 				Transaction: t,
@@ -118,13 +168,21 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 			})
 
 			// Store transaction details
+			storeStart := time.Now()
 			if err := a.storeWithEmbedding(gCtx, t, details); err != nil {
 				// If context was canceled, return immediately
 				if errors.Is(err, context.Canceled) {
 					return err
 				}
+				a.logger.Error("Failed to store transaction",
+					"error", err,
+					"payee", t.Payee,
+					"duration", time.Since(storeStart))
 				return fmt.Errorf("error storing transaction: %w", err)
 			}
+			a.logger.Debug("Transaction storage completed",
+				"payee", t.Payee,
+				"duration", time.Since(storeStart))
 
 			// Update progress
 			if err := progress.Add(1); err != nil {
@@ -148,12 +206,16 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 		return nil, fmt.Errorf("error analyzing transactions: %w", err)
 	}
 
-	a.logger.Info("Successfully analyzed transactions", "total", len(filteredTransactions), "skipped", len(transactions)-len(filteredTransactions))
+	a.logger.Info("Successfully analyzed transactions",
+		"total_duration", time.Since(startTime),
+		"total", len(filteredTransactions),
+		"skipped", len(transactions)-len(filteredTransactions))
 	return analyzedTransactions, nil
 }
 
 // analyzeTransaction uses an LLM to extract structured information from a transaction
 func (a *Analyzer) analyzeTransaction(ctx context.Context, t types.Transaction, model string) (*types.TransactionDetails, error) {
+	startTime := time.Now()
 	a.logger.Info("Analyzing transaction",
 		"payee", t.Payee,
 		"amount", t.Amount,
@@ -161,6 +223,7 @@ func (a *Analyzer) analyzeTransaction(ctx context.Context, t types.Transaction, 
 		"model", model)
 
 	// First, generate an embedding for the transaction text
+	embeddingStart := time.Now()
 	searchText := fmt.Sprintf("%s %s", t.Payee, t.Amount)
 	a.logger.Debug("Generating embedding for transaction",
 		"search_text", searchText)
@@ -169,18 +232,29 @@ func (a *Analyzer) analyzeTransaction(ctx context.Context, t types.Transaction, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate embedding: %w", err)
 	}
+	a.logger.Debug("Embedding generation completed",
+		"duration", time.Since(embeddingStart))
 
 	// Find similar transactions
+	similarStart := time.Now()
 	similarTransactions, err := a.findSimilarTransactions(ctx, embedding, 0.8)
 	if err != nil {
 		a.logger.Warn("Failed to find similar transactions",
 			"error", err,
-			"payee", t.Payee)
+			"payee", t.Payee,
+			"duration", time.Since(similarStart))
 		// Continue with analysis even if finding similar transactions fails
+	} else {
+		a.logger.Debug("Similar transactions search completed",
+			"count", len(similarTransactions),
+			"duration", time.Since(similarStart))
 	}
 
 	// Get the most common merchant name from similar transactions
+	merchantStart := time.Now()
 	consistentMerchant := a.findConsistentMerchantName(similarTransactions)
+	a.logger.Debug("Merchant name consistency check completed",
+		"duration", time.Since(merchantStart))
 
 	// Log whether we'll use a consistent merchant name
 	if consistentMerchant != "" {
@@ -365,7 +439,8 @@ Return the information in JSON format with these fields:
 		"type", details.Type,
 		"merchant", details.Merchant,
 		"category", details.Category,
-		"similar_merchant_found", consistentMerchant != "")
+		"similar_merchant_found", consistentMerchant != "",
+		"total_duration", time.Since(startTime))
 
 	return details, nil
 }
@@ -380,38 +455,76 @@ func generateTransactionID(t types.Transaction) string {
 
 // Store stores a transaction and its details in the database
 func (a *Analyzer) storeWithEmbedding(ctx context.Context, t types.Transaction, details *types.TransactionDetails) error {
+	startTime := time.Now()
+
 	// Generate embedding for the search body
+	embeddingStart := time.Now()
 	embedding, err := a.embeddings.GenerateEmbedding(ctx, details.SearchBody)
 	if err != nil {
 		return fmt.Errorf("failed to generate embedding: %w", err)
 	}
+	a.logger.Debug("Search body embedding generated",
+		"duration", time.Since(embeddingStart))
 
 	// Serialize the embedding for sqlite-vec
+	serializeStart := time.Now()
 	serializedEmbedding, err := a.db.SerializeEmbedding(embedding)
 	if err != nil {
 		return fmt.Errorf("failed to serialize embedding: %w", err)
 	}
+	a.logger.Debug("Embedding serialization completed",
+		"duration", time.Since(serializeStart))
 
 	// Begin transaction
+	txStart := time.Now()
 	tx, err := a.db.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
+	a.logger.Debug("Transaction started",
+		"duration", time.Since(txStart))
 
 	// Store transaction details
-	if err := a.db.Store(ctx, t, details); err != nil {
-		return fmt.Errorf("failed to store transaction: %w", err)
+	storeStart := time.Now()
+	id := generateTransactionID(t)
+	date, dateErr := time.ParseInLocation("02/01/2006", t.Date, time.Local)
+	if dateErr != nil {
+		return fmt.Errorf("failed to parse transaction date: %v", dateErr)
 	}
 
+	// Insert or replace transaction
+	_, err = tx.ExecContext(ctx, `
+		INSERT OR REPLACE INTO transactions (
+			id, date, amount, payee, bank,
+			type, merchant, location, details_category, description, card_number, search_body,
+			foreign_amount, foreign_currency,
+			transfer_to_account, transfer_from_account, transfer_reference
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		id, date, t.Amount, t.Payee, t.Bank,
+		details.Type, details.Merchant, details.Location, details.Category, details.Description, details.CardNumber, details.SearchBody,
+		getForeignAmount(details), getForeignCurrency(details),
+		getTransferToAccount(details), getTransferFromAccount(details), getTransferReference(details),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to store transaction: %w", err)
+	}
+	a.logger.Debug("Transaction details stored",
+		"duration", time.Since(storeStart))
+
 	// Get the rowid of the inserted transaction
+	rowidStart := time.Now()
 	var rowid int64
-	err = tx.QueryRowContext(ctx, `SELECT rowid FROM transactions WHERE id = ?`, generateTransactionID(t)).Scan(&rowid)
+	err = tx.QueryRowContext(ctx, `SELECT rowid FROM transactions WHERE id = ?`, id).Scan(&rowid)
 	if err != nil {
 		return fmt.Errorf("failed to get transaction rowid: %w", err)
 	}
+	a.logger.Debug("Transaction rowid retrieved",
+		"duration", time.Since(rowidStart))
 
 	// Store embedding
+	vecStart := time.Now()
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO transactions_vec(rowid, embedding)
 		VALUES (?, ?)
@@ -419,11 +532,20 @@ func (a *Analyzer) storeWithEmbedding(ctx context.Context, t types.Transaction, 
 	if err != nil {
 		return fmt.Errorf("failed to store embedding: %w", err)
 	}
+	a.logger.Debug("Vector embedding stored",
+		"duration", time.Since(vecStart))
 
 	// Commit transaction
+	commitStart := time.Now()
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
+	a.logger.Debug("Transaction committed",
+		"duration", time.Since(commitStart))
+
+	a.logger.Info("Transaction storage completed",
+		"payee", t.Payee,
+		"total_duration", time.Since(startTime))
 
 	return nil
 }

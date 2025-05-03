@@ -2,6 +2,7 @@ package qif
 
 import (
 	"bufio"
+	"io"
 	"os"
 	"strings"
 )
@@ -18,6 +19,16 @@ type Transaction struct {
 
 // ParseFile reads a QIF file and returns a slice of transactions
 func ParseFile(filename string) ([]Transaction, error) {
+	infile, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer infile.Close()
+	return ParseReader(infile)
+}
+
+// ParseReader reads a QIF file from an io.Reader and returns a slice of transactions
+func ParseReader(r io.Reader) ([]Transaction, error) {
 	FIELDS := map[string]string{
 		"D": "date",
 		"T": "amount",
@@ -27,13 +38,7 @@ func ParseFile(filename string) ([]Transaction, error) {
 		"M": "memo",
 	}
 
-	infile, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer infile.Close()
-
-	scanner := bufio.NewScanner(infile)
+	scanner := bufio.NewScanner(r)
 	scanner.Split(bufio.ScanLines)
 
 	var transactions []Transaction

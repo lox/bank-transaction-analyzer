@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/charmbracelet/log"
-	"github.com/lox/ing-transaction-analyzer/internal/analyzer"
-	"github.com/lox/ing-transaction-analyzer/internal/db"
-	"github.com/lox/ing-transaction-analyzer/internal/types"
+	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
+	"github.com/lox/bank-transaction-analyzer/internal/db"
+	"github.com/lox/bank-transaction-analyzer/internal/types"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )

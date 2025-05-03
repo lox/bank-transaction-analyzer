@@ -8,8 +8,8 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/charmbracelet/log"
-	"github.com/lox/ing-transaction-analyzer/internal/analyzer"
-	"github.com/lox/ing-transaction-analyzer/internal/db"
+	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
+	"github.com/lox/bank-transaction-analyzer/internal/db"
 )
 
 type GlobalFlags struct {

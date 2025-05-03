@@ -8,10 +8,10 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/charmbracelet/log"
-	"github.com/lox/ing-transaction-analyzer/internal/analyzer"
-	"github.com/lox/ing-transaction-analyzer/internal/db"
-	"github.com/lox/ing-transaction-analyzer/internal/qif"
-	"github.com/lox/ing-transaction-analyzer/internal/types"
+	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
+	"github.com/lox/bank-transaction-analyzer/internal/bank"
+	"github.com/lox/bank-transaction-analyzer/internal/bank/ing"
+	"github.com/lox/bank-transaction-analyzer/internal/db"
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -19,9 +19,10 @@ type GlobalFlags struct {
 	DataDir     string `help:"Path to data directory" default:"./data"`
 	OpenAIKey   string `help:"OpenAI API key" env:"OPENAI_API_KEY" required:""`
 	OpenAIModel string `help:"OpenAI model to use for analysis" default:"gpt-4.1" env:"OPENAI_MODEL"`
-	Concurrency int    `help:"Number of concurrent transactions to process" default:"3"`
+	Concurrency int    `help:"Number of concurrent transactions to process" default:"5"`
 	Verbose     bool   `help:"Enable verbose logging" default:"false" short:"v"`
 	Timezone    string `help:"Timezone to use for transaction dates" required:"" default:"Australia/Melbourne"`
+	Bank        string `help:"Bank to use for processing" default:"ing-australia" enum:"ing-australia"`
 }
 
 type CLI struct {
@@ -51,33 +52,41 @@ func (c *CLI) Run() error {
 	}
 	defer database.Close()
 
-	// Parse QIF file
-	qifTransactions, err := qif.ParseFile(c.QIFFile)
-	if err != nil {
-		logger.Fatal("Failed to parse QIF file", "error", err)
+	// Initialize bank registry
+	registry := bank.NewRegistry()
+	registry.Register(ing.New())
+
+	// Get bank implementation
+	bankImpl, ok := registry.Get(c.Bank)
+	if !ok {
+		logger.Fatal("Unknown bank", "bank", c.Bank, "available", registry.List())
 	}
 
-	// Convert QIF transactions to generic transactions
-	transactions := make([]types.Transaction, len(qifTransactions))
-	for i, t := range qifTransactions {
-		transactions[i] = types.Transaction{
-			Date:   t.Date,
-			Amount: t.Amount,
-			Payee:  t.Payee,
-		}
+	// Open QIF file
+	file, err := os.Open(c.QIFFile)
+	if err != nil {
+		logger.Fatal("Failed to open QIF file", "error", err)
+	}
+	defer file.Close()
+
+	// Parse transactions
+	transactions, err := bankImpl.ParseTransactions(context.Background(), file)
+	if err != nil {
+		logger.Fatal("Failed to parse transactions", "error", err)
 	}
 
 	// Process transactions
 	processCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	// Analyze transactions
+	// Create analyzer
 	an, err := analyzer.NewAnalyzer(client, logger, database)
 	if err != nil {
 		logger.Fatal("Failed to create analyzer", "error", err)
 	}
 
-	_, err = an.AnalyzeTransactions(processCtx, transactions, analyzer.Config{
+	// Process transactions
+	_, err = bankImpl.ProcessTransactions(processCtx, transactions, an, analyzer.Config{
 		Model:       c.OpenAIModel,
 		Concurrency: c.Concurrency,
 		Progress:    !c.Verbose,
@@ -93,8 +102,8 @@ func main() {
 	// Normal Kong CLI handling
 	var cli CLI
 	ctx := kong.Parse(&cli,
-		kong.Name("ing-transaction-analyzer"),
-		kong.Description("A tool to analyze ING bank transactions from QIF files using OpenAI"),
+		kong.Name("bank-transaction-analyzer"),
+		kong.Description("A tool to analyze bank transactions"),
 		kong.UsageOnError(),
 	)
 
