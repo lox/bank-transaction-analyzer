@@ -110,11 +110,9 @@ Options:
 The MCP server provides programmatic access to your transaction data through Cursor's chat interface.
 
 Available tools:
-- `list_categories`: List all transaction categories with counts
-- `list_transactions`: List transactions chronologically
-- `search_transactions`: Search transactions with filters
-- `get_transactions`: Retrieve recent transactions
-- `search_transaction_freetext`: Free-text search with SQLite FTS5
+- `search_transactions`: Search for transactions in your history
+- `list_transactions`: List transactions chronologically with optional filters
+- `list_categories`: List all unique transaction categories with their transaction counts
 
 ## Configuration
 
@@ -211,9 +209,9 @@ go build ./cmd/...
 
 ```
 .
-├── cmd/                    # Command-line tools
-├── internal/              # Internal packages
-│   ├── analyzer/         # Transaction analysis
+├── cmd/                 # Command-line tools
+├── internal/            # Internal packages
+│   ├── analyzer/        # Transaction analysis
 │   ├── bank/            # Bank-specific logic
 │   ├── db/              # Database operations
 │   ├── mcp/             # MCP server implementation
@@ -234,7 +232,7 @@ A: Currently ING Australia QIF format is supported, with plans to add support fo
 A: Categories are extracted using GPT-4.1 analysis of transaction descriptions and merchant information.
 
 ### Q: Is my transaction data secure?
-A: Yes, all data is stored locally in SQLite. No data is sent to external services except for OpenAI API calls.
+A: Not really, all data is stored locally in SQLite, unencrypted. No data is sent to external services except for OpenAI API calls.
 
 ## License
 
