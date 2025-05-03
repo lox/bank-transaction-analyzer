@@ -1,76 +1,146 @@
 # Bank Transaction Analyzer
 
-A tool for analyzing bank transactions using GPT-4.1 to extract structured information from transaction descriptions. The main interface is through an MCP server that provides programmatic access to your transaction data via the Model Context Protocol.
-
-## Quick Start
-
-### Installation
-
-```bash
-go install github.com/lox/bank-transaction-analyzer/cmd/ing-mcp-server@latest
-```
-
-### Configuration
-
-1. Set up your OpenAI API key:
-```bash
-export OPENAI_API_KEY=your-api-key
-```
-
-2. Configure Cursor to use the MCP server by setting `.cursor/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "ing-transactions": {
-      "command": "ing-mcp-server"
-    }
-  }
-}
-```
-
-### Available MCP Tools
-
-| Tool Name | Description |
-|-----------|-------------|
-| `list_categories` | Lists all unique transaction categories with their counts |
-| `list_transactions` | Lists transactions chronologically with optional filters |
-| `search_transactions` | Searches for transactions in your history |
+A powerful tool for analyzing bank transactions using GPT-4.1 to extract structured information from transaction descriptions. Provides both CLI and MCP server interfaces for flexible access to your transaction data. Supports multiple banks, with ING Australia QIF exports supported initially.
 
 ## Features
 
-- Parses ING QIF transaction files
-- Extracts structured information from transaction descriptions using GPT-4.1
-- Stores transaction details in SQLite for efficient querying and analysis
-- Progress tracking and detailed logging
-- Parallel processing of transactions
-- MCP server for programmatic access to transaction data
+- **Transaction Analysis**
+  - Multi-bank support with ING Australia QIF exports supported initially
+  - Extracts structured information using GPT-4.1
+  - Categorizes transactions automatically
+  - Identifies merchants and locations
+
+- **Data Management**
+  - SQLite database for efficient storage
+  - Full-text and vector similarity search
+  - Hybrid search using Reciprocal Rank Fusion
+  - Progress tracking and detailed logging
+
+- **Multiple Interfaces**
+  - CLI tools for direct access
+  - MCP server for programmatic access
+  - Natural language querying through Cursor
+
+- **Performance**
+  - Parallel transaction processing
+  - Optimized database indexes
+  - Efficient search algorithms
+
+## Installation
+
+### Prerequisites
+
+- Go 1.24 or later
+- OpenAI API key
+- SQLite 3
+
+### Using Hermit
+
+The project uses [CashApp Hermit](https://cashapp.github.io/hermit/) for dependency management. After cloning the repository, run:
+
+```bash
+cd bank-transaction-analyzer
+. ./bin/activate-hermit
+```
+
+This will set up the development environment with all required dependencies.
+
+### Available Commands
+
+After activating Hermit, the following commands are available in your PATH:
+
+- `bank-transaction-analyzer`: Main transaction analysis tool
+- `bank-mcp-server`: MCP server for programmatic access
+- `bank-transaction-search`: Search tool for transactions
+
+## Quick Start
+
+1. Export your transactions from your bank in QIF format (ING Australia QIF exports supported initially)
+2. Set up your OpenAI API key:
+   ```bash
+   export OPENAI_API_KEY=your-api-key
+   ```
+3. Run the analyzer:
+   ```bash
+   bank-transaction-analyzer --qif-file Transactions.qif
+   ```
+4. Configure Cursor for MCP access:
+   ```json
+   {
+     "mcpServers": {
+       "ing-transactions": {
+         "command": "bank-mcp-server"
+       }
+     }
+   }
+   ```
 
 ## Usage
 
-### CLI Tool
+### CLI Tools
 
-1. Export your transactions from ING in QIF format
-2. Run the analyzer:
+#### Bank Transaction Analyzer
 
 ```bash
-go install github.com/lox/bank-transaction-analyzer/cmd/bank-transaction-analyzer@latest
-bank-transaction-analyzer --qif-file Transactions.qif
+bank-transaction-analyzer --qif-file Transactions.qif [options]
 ```
 
-### Options
-
-- `--qif-file`: Path to the QIF file (required)
-- `--data-dir`: Path to data directory (default: "./data")
-- `--openai-key`: OpenAI API key (required, can also be set via OPENAI_API_KEY env var)
-- `--openai-model`: OpenAI model to use for analysis (default: "gpt-4.1")
-- `--concurrency`: Number of concurrent transactions to process (default: 5)
+Options:
+- `--qif-file`: Path to QIF file (required)
+- `--data-dir`: Data directory path (default: "./data")
+- `--openai-key`: OpenAI API key (can also use env var)
+- `--openai-model`: Model to use (default: "gpt-4.1")
+- `--concurrency`: Concurrent transactions to process (default: 5)
 - `--verbose`: Enable verbose logging
-- `--timezone`: Timezone to use for transaction dates (default: "Australia/Melbourne")
+- `--timezone`: Transaction timezone (default: "Australia/Melbourne")
 
-### Data Storage
+#### Bank Transaction Search
 
-Transactions are stored in a SQLite database (`transactions.db`) in your data directory. The database schema includes:
+```bash
+bank-transaction-search "query" [options]
+```
+
+Options:
+- `--days`: Search window in days (default: 30)
+- `--limit`: Maximum results to return (default: 10)
+- `--data-dir`: Data directory path
+
+### MCP Server
+
+The MCP server provides programmatic access to your transaction data through Cursor's chat interface.
+
+Available tools:
+- `list_categories`: List all transaction categories with counts
+- `list_transactions`: List transactions chronologically
+- `search_transactions`: Search transactions with filters
+- `get_transactions`: Retrieve recent transactions
+- `search_transaction_freetext`: Free-text search with SQLite FTS5
+
+## Configuration
+
+### Environment Variables
+
+- `OPENAI_API_KEY`: Your OpenAI API key
+- `DATA_DIR`: Path to data directory
+- `TZ`: Timezone for transaction dates
+
+### Data Directory Structure
+
+```
+data/
+  ├── transactions.db    # SQLite database
+  ├── transactions_fts   # Full-text search index
+  └── transactions_vec   # Vector similarity index
+```
+
+## Data Storage
+
+All transaction data is stored in a single SQLite database at `data/transactions.db`. The database uses two specialized virtual tables for search:
+
+1. `transactions_fts`: A full-text search table using SQLite FTS5
+2. `transactions_vec`: A vector similarity table using sqlite-vec for semantic search
+
+The main transactions table schema:
 
 ```sql
 CREATE TABLE transactions (
@@ -78,145 +148,93 @@ CREATE TABLE transactions (
     date DATE NOT NULL,
     amount DECIMAL(15,2) NOT NULL,
     payee TEXT NOT NULL,
-    -- Transaction details
     type TEXT NOT NULL,
     merchant TEXT NOT NULL,
     location TEXT,
     details_category TEXT,
     description TEXT,
     card_number TEXT,
-    -- Foreign amount details
     foreign_amount DECIMAL(15,2),
     foreign_currency TEXT,
-    -- Transfer details
     transfer_to_account TEXT,
     transfer_from_account TEXT,
     transfer_reference TEXT
 )
 ```
 
-The database uses two specialized virtual tables for search:
+## Search Capabilities
 
-1. `transactions_fts`: A full-text search table using SQLite FTS5
-2. `transactions_vec`: A vector similarity table using sqlite-vec for semantic search
+The tool implements a hybrid search system combining:
 
-### Hybrid Search
+1. **Full-text Search (FTS5)**
+   - Exact and partial text matches
+   - SQLite FTS5 syntax support
+   - Configurable search weights
 
-The transaction search combines both full-text search and vector similarity search using a technique called Reciprocal Rank Fusion (RRF), as described in [Alex Garcia's blog post on Hybrid Search with SQLite](https://alexgarcia.xyz/blog/2024/sqlite-vec-hybrid-search/index.html).
+2. **Vector Similarity Search (sqlite-vec)**
+   - Semantic matching using Snowflake Arctic Embed v1.5
+   - Local embeddings generation via llama.cpp
+   - Cosine similarity scoring
 
-This hybrid approach provides several benefits:
-- Full-text search catches exact and partial text matches
-- Vector similarity search catches semantic similarities and related terms
-- RRF combines both results, weighted to favor semantic matches
-- Results include both text and vector similarity scores for transparency
+3. **Reciprocal Rank Fusion (RRF)**
+   - Combines both search methods
+   - Weighted towards semantic matches
+   - Formula: `RRF_score = (2.0 / (k + vector_score)) + (1.0 / (k + text_score))`
 
-Example search results show both scores:
-```
-Search Scores:
-  Vector Score: 0.2345
-  Text Score: -8.6605
-  RRF Score: 0.0528
-```
+### Embeddings Generation
 
-The RRF formula used is:
-```
-RRF_score = (2.0 / (k + vector_score)) + (1.0 / (k + text_score))
-```
-Where:
-- Vector search is weighted 2x to favor semantic matches
-- k = 60 (standard RRF constant)
-- Lower scores indicate better matches
-
-Indexes are created for efficient querying on:
-- Payee
-- Date
-- Transaction type
-- Merchant
-- Category
-- Amount
-
-### MCP Server
-
-The MCP server provides programmatic access to your transaction data via the Model Context Protocol (see https://modelcontextprotocol.io/introduction).
-
-This lets you chat with the data.
-
-#### Installation
+The tool uses a local llama.cpp server for generating embeddings, running with:
 
 ```bash
-go install github.com/lox/bank-transaction-analyzer/cmd/ing-mcp-server@latest
+build/bin/llama-server -m models/snowflake-arctic-embed-m-v1.5.d70deb40.f16.gguf --embeddings -c 768 -ngl 0
 ```
 
-#### Configuring with Cursor
+This configuration:
+- Uses the Snowflake Arctic Embed v1.5 model
+- Generates 768-dimensional embeddings
+- Runs on CPU (ngl 0)
+- Optimized for embedding generation
 
-Set `.cursor/mcp.json` to:
-
-```json
-{
-  "mcpServers": {
-    "ing-transactions": {
-      "command": "ing-mcp-server"
-    }
-  }
-}
-```
-
-And then chat with your data, the current tools are supported:
-
-| Tool Name | Description |
-|-----------|-------------|
-| `get_transactions` | Retrieves transactions from the database for a specified number of days. Requires a `days` parameter (integer) that determines how far back to look for transactions. Returns formatted transaction details including date, amount, payee, type, merchant, location, category, description, card number, foreign amount (if applicable), and transfer details (if applicable). |
-| `search_transaction_freetext` | Searches transactions using free-text search. Requires a `query` parameter (string) for the search term and a `days` parameter (integer) to specify how far back to search. Supports SQLite FTS5 syntax for advanced search capabilities. Returns matching transactions with full details. |
-
-## How it Works
-
-1. **Initial Setup**: Import your transaction data using the CLI tool
-2. **Transaction Analysis**: Each transaction's details are analyzed using GPT-4 to extract structured information
-3. **Storage**: Transaction details are stored in a SQLite database for efficient querying
-4. **MCP Interface**: Access and analyze your transaction data through the MCP server
-5. **Results**: Query your transactions using natural language through Cursor's chat interface
-
-## Example Output
-
-Each transaction is stored as a JSON file with the following structure:
-
-```json
-{
-  "transaction": {
-    "date": "2024-03-15",
-    "amount": "15.99",
-    "payee": "Netflix",
-    "category": "Entertainment",
-    "number": "",
-    "memo": ""
-  },
-  "details": {
-    "type": "purchase",
-    "merchant": "Netflix",
-    "category": "Entertainment",
-    "description": "Monthly subscription"
-  }
-}
-```
-
-## Configuration
-
-The tool uses OpenAI's API for transaction analysis. You'll need to set your OpenAI API key:
-
-```bash
-export OPENAI_API_KEY=your-api-key
-```
+The embeddings are stored in the `transactions_vec` virtual table and used for semantic search operations.
 
 ## Development
 
-To build from source:
+### Building from Source
 
 ```bash
 git clone https://github.com/lox/bank-transaction-analyzer
 cd bank-transaction-analyzer
-go build -o bank-transaction-analyzer ./cmd/bank-transaction-analyzer
-go build -o ing-mcp-server ./cmd/ing-mcp-server
+go build ./cmd/...
 ```
+
+### Project Structure
+
+```
+.
+├── cmd/                    # Command-line tools
+├── internal/              # Internal packages
+│   ├── analyzer/         # Transaction analysis
+│   ├── bank/            # Bank-specific logic
+│   ├── db/              # Database operations
+│   ├── mcp/             # MCP server implementation
+│   ├── qif/             # QIF file parsing
+│   └── types/           # Shared types
+└── data/                # Data storage
+```
+
+## FAQ
+
+### Q: How do I update the transaction database?
+A: Run the analyzer again with the new QIF file. It will update existing transactions and add new ones.
+
+### Q: Can I use a different bank's export format?
+A: Currently ING Australia QIF format is supported, with plans to add support for other banks and formats.
+
+### Q: How are transaction categories determined?
+A: Categories are extracted using GPT-4.1 analysis of transaction descriptions and merchant information.
+
+### Q: Is my transaction data secure?
+A: Yes, all data is stored locally in SQLite. No data is sent to external services except for OpenAI API calls.
 
 ## License
 
