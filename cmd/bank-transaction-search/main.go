@@ -65,7 +65,7 @@ func (c *CLI) Run() error {
 	}
 
 	// Search transactions
-	transactions, err := database.SearchTransactionsHybrid(context.Background(), c.Query, serializedEmbedding, c.Days, c.Limit)
+	transactions, err := database.SearchTransactions(context.Background(), c.Query, serializedEmbedding, c.Days, c.Limit)
 	if err != nil {
 		logger.Fatal("Failed to search transactions", "error", err)
 	}

@@ -162,7 +162,7 @@ func (s *Server) searchTransactionsHandler(ctx context.Context, request mcp.Call
 	}
 
 	s.logger.Debug("Searching transactions", "query", query, "days", days, "limit", limit)
-	transactions, err := s.db.SearchTransactionsHybrid(ctx, query, serializedEmbedding, days, limit)
+	transactions, err := s.db.SearchTransactions(ctx, query, serializedEmbedding, days, limit)
 	if err != nil {
 		s.logger.Error("Failed to search transactions", "error", err)
 		return nil, fmt.Errorf("failed to search transactions: %w", err)

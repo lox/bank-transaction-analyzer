@@ -20,7 +20,8 @@ type GlobalFlags struct {
 	OpenAIKey   string `help:"OpenAI API key" env:"OPENAI_API_KEY" required:""`
 	OpenAIModel string `help:"OpenAI model to use for analysis" default:"gpt-4.1" env:"OPENAI_MODEL"`
 	Concurrency int    `help:"Number of concurrent transactions to process" default:"5"`
-	Verbose     bool   `help:"Enable verbose logging" default:"false" short:"v"`
+	LogLevel    string `help:"Log level (debug, info, warn, error)" default:"warn" enum:"debug,info,warn,error"`
+	NoProgress  bool   `help:"Disable progress bar" default:"false"`
 	Timezone    string `help:"Timezone to use for transaction dates" required:"" default:"Australia/Melbourne"`
 	Bank        string `help:"Bank to use for processing" default:"ing-australia" enum:"ing-australia"`
 }
@@ -32,9 +33,13 @@ type CLI struct {
 
 func (c *CLI) Run() error {
 	logger := log.New(os.Stderr)
-	if c.Verbose {
-		logger.SetLevel(log.DebugLevel)
+
+	// Set log level
+	level, err := log.ParseLevel(c.LogLevel)
+	if err != nil {
+		logger.Fatal("Invalid log level", "error", err)
 	}
+	logger.SetLevel(level)
 
 	// Initialize OpenAI client
 	client := openai.NewClient(c.OpenAIKey)
@@ -89,7 +94,7 @@ func (c *CLI) Run() error {
 	_, err = bankImpl.ProcessTransactions(processCtx, transactions, an, analyzer.Config{
 		Model:       c.OpenAIModel,
 		Concurrency: c.Concurrency,
-		Progress:    !c.Verbose,
+		Progress:    !c.NoProgress,
 	})
 	if err != nil {
 		logger.Fatal("Failed to process transactions", "error", err)

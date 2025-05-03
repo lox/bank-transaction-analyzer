@@ -385,51 +385,9 @@ func (d *DB) GetTransactions(ctx context.Context, days int) ([]types.Transaction
 	var transactions []types.TransactionWithDetails
 	for rows.Next() {
 		var t types.TransactionWithDetails
-		var date time.Time
-		var amount decimal.Decimal
-		var foreignAmount sql.NullFloat64
-		var foreignCurrency sql.NullString
-		var transferToAccount sql.NullString
-		var transferFromAccount sql.NullString
-		var transferReference sql.NullString
-
-		if err := rows.Scan(
-			&date, &amount, &t.Payee, &t.Bank,
-			&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
-			&foreignAmount, &foreignCurrency,
-			&transferToAccount, &transferFromAccount, &transferReference,
-		); err != nil {
-			return nil, fmt.Errorf("failed to scan transaction: %w", err)
+		if err := scanTransactionRow(rows, &t); err != nil {
+			return nil, err
 		}
-
-		// Format date and amount as strings
-		t.Date = date.Format("02/01/2006")
-		t.Amount = amount.String()
-
-		// Set foreign amount if present
-		if foreignAmount.Valid && foreignCurrency.Valid {
-			t.Details.ForeignAmount = &struct {
-				Amount   decimal.Decimal `json:"amount"`
-				Currency string          `json:"currency"`
-			}{
-				Amount:   decimal.NewFromFloat(foreignAmount.Float64),
-				Currency: foreignCurrency.String,
-			}
-		}
-
-		// Set transfer details if present
-		if transferToAccount.Valid || transferFromAccount.Valid || transferReference.Valid {
-			t.Details.TransferDetails = &struct {
-				ToAccount   string `json:"to_account,omitempty"`
-				FromAccount string `json:"from_account,omitempty"`
-				Reference   string `json:"reference,omitempty"`
-			}{
-				ToAccount:   transferToAccount.String,
-				FromAccount: transferFromAccount.String,
-				Reference:   transferReference.String,
-			}
-		}
-
 		transactions = append(transactions, t)
 	}
 
@@ -440,420 +398,69 @@ func (d *DB) GetTransactions(ctx context.Context, days int) ([]types.Transaction
 	return transactions, nil
 }
 
-// SearchTransactions searches for transactions using full-text search
-func (d *DB) SearchTransactions(ctx context.Context, query string, days int) ([]types.TransactionWithDetails, error) {
-	searchQuery := `
-		SELECT t.date, t.amount, t.payee, t.bank,
-			t.type, t.merchant, t.location, t.details_category, t.description, t.card_number,
-			t.foreign_amount, t.foreign_currency,
-			t.transfer_to_account, t.transfer_from_account, t.transfer_reference
-		FROM transactions t
-		JOIN transactions_fts fts ON t.rowid = fts.rowid
-		WHERE fts.search_body MATCH ?
-		AND t.date >= date('now', ? || ' days')
-		ORDER BY t.date DESC
-	`
-
-	rows, err := d.db.QueryContext(ctx, searchQuery, query, -days)
-	if err != nil {
-		return nil, fmt.Errorf("failed to search transactions: %w", err)
-	}
-	defer rows.Close()
-
-	var transactions []types.TransactionWithDetails
-	for rows.Next() {
-		var t types.TransactionWithDetails
-		var date time.Time
-		var amount decimal.Decimal
-		var foreignAmount sql.NullFloat64
-		var foreignCurrency sql.NullString
-		var transferToAccount sql.NullString
-		var transferFromAccount sql.NullString
-		var transferReference sql.NullString
-
-		if err := rows.Scan(
-			&date, &amount, &t.Payee, &t.Bank,
-			&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
-			&foreignAmount, &foreignCurrency,
-			&transferToAccount, &transferFromAccount, &transferReference,
-		); err != nil {
-			return nil, fmt.Errorf("failed to scan transaction: %w", err)
-		}
-
-		// Format date and amount as strings
-		t.Date = date.Format("02/01/2006")
-		t.Amount = amount.String()
-
-		// Set foreign amount if present
-		if foreignAmount.Valid && foreignCurrency.Valid {
-			t.Details.ForeignAmount = &struct {
-				Amount   decimal.Decimal `json:"amount"`
-				Currency string          `json:"currency"`
-			}{
-				Amount:   decimal.NewFromFloat(foreignAmount.Float64),
-				Currency: foreignCurrency.String,
-			}
-		}
-
-		// Set transfer details if present
-		if transferToAccount.Valid || transferFromAccount.Valid || transferReference.Valid {
-			t.Details.TransferDetails = &struct {
-				ToAccount   string `json:"to_account,omitempty"`
-				FromAccount string `json:"from_account,omitempty"`
-				Reference   string `json:"reference,omitempty"`
-			}{
-				ToAccount:   transferToAccount.String,
-				FromAccount: transferFromAccount.String,
-				Reference:   transferReference.String,
-			}
-		}
-
-		transactions = append(transactions, t)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating transactions: %w", err)
-	}
-
-	return transactions, nil
-}
-
-// SearchTransactionsByVector searches for transactions using vector similarity
-func (d *DB) SearchTransactionsByVector(ctx context.Context, embedding []byte, days int, limit int) ([]types.TransactionWithDetails, error) {
-	query := `
-		WITH vec_matches AS (
-			SELECT
-				rowid as transaction_id,
-				row_number() OVER (ORDER BY distance) as rank_number,
-				distance
-			FROM transactions_vec
-			WHERE embedding MATCH ? AND k = ?
-			AND rowid IN (
-				SELECT rowid FROM transactions
-				WHERE date >= date('now', ? || ' days')
-			)
-		)
-		SELECT
-			t.date, t.amount, t.payee,
-			t.type, t.merchant, t.location, t.details_category, t.description, t.card_number,
-			t.foreign_amount, t.foreign_currency,
-			t.transfer_to_account, t.transfer_from_account, t.transfer_reference,
-			vm.distance
-		FROM vec_matches vm
-		JOIN transactions t ON t.rowid = vm.transaction_id
-		ORDER BY vm.rank_number ASC
-	`
-
-	rows, err := d.db.QueryContext(ctx, query, embedding, limit, -days)
-	if err != nil {
-		return nil, fmt.Errorf("vector search failed: %w", err)
-	}
-	defer rows.Close()
-
-	var transactions []types.TransactionWithDetails
-	for rows.Next() {
-		var t types.TransactionWithDetails
-		var date time.Time
-		var amount decimal.Decimal
-		var foreignAmount sql.NullFloat64
-		var foreignCurrency sql.NullString
-		var transferToAccount sql.NullString
-		var transferFromAccount sql.NullString
-		var transferReference sql.NullString
-		var distance float64
-
-		if err := rows.Scan(
-			&date, &amount, &t.Payee,
-			&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
-			&foreignAmount, &foreignCurrency,
-			&transferToAccount, &transferFromAccount, &transferReference,
-			&distance,
-		); err != nil {
-			return nil, fmt.Errorf("failed to scan transaction: %w", err)
-		}
-
-		// Format date and amount as strings
-		t.Date = date.Format("02/01/2006")
-		t.Amount = amount.String()
-
-		// Set foreign amount if present
-		if foreignAmount.Valid && foreignCurrency.Valid {
-			t.Details.ForeignAmount = &struct {
-				Amount   decimal.Decimal `json:"amount"`
-				Currency string          `json:"currency"`
-			}{
-				Amount:   decimal.NewFromFloat(foreignAmount.Float64),
-				Currency: foreignCurrency.String,
-			}
-		}
-
-		// Set transfer details if present
-		if transferToAccount.Valid || transferFromAccount.Valid || transferReference.Valid {
-			t.Details.TransferDetails = &struct {
-				ToAccount   string `json:"to_account,omitempty"`
-				FromAccount string `json:"from_account,omitempty"`
-				Reference   string `json:"reference,omitempty"`
-			}{
-				ToAccount:   transferToAccount.String,
-				FromAccount: transferFromAccount.String,
-				Reference:   transferReference.String,
-			}
-		}
-
-		transactions = append(transactions, t)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating transactions: %w", err)
-	}
-
-	return transactions, nil
-}
-
-// SearchTransactionsHybrid combines vector and full-text search results using Reciprocal Rank Fusion
-func (d *DB) SearchTransactionsHybrid(ctx context.Context, query string, embedding []byte, days int, limit int) ([]types.TransactionSearchResult, error) {
+// SearchTransactions performs a hybrid search combining vector and text search using RRF
+func (d *DB) SearchTransactions(ctx context.Context, query string, embedding []byte, days int, limit int) ([]types.TransactionSearchResult, error) {
 	// Constants for RRF algorithm
 	const (
 		rrf_k = 60 // Constant k in RRF formula, typically between 60-80
-		// Weights for different search methods - give more weight to vector search
-		vectorWeight = 2.0 // Increased weight for vector similarity
+		// Weights for different search methods
+		vectorWeight = 2.0 // Higher weight for vector similarity
 		textWeight   = 1.0 // Base weight for text search
 	)
-
-	// Run vector search query
-	vectorQuery := `
-		WITH vec_matches AS (
-			SELECT
-				t.date, t.amount, t.payee,
-				t.type, t.merchant, t.location, t.details_category as category, t.description, t.card_number,
-				t.foreign_amount, t.foreign_currency,
-				t.transfer_to_account, t.transfer_from_account, t.transfer_reference,
-				vm.distance as vector_score,
-				row_number() OVER (ORDER BY vm.distance ASC) as vector_rank
-			FROM transactions t
-			JOIN transactions_vec vm ON t.rowid = vm.rowid
-			WHERE vm.embedding MATCH ? AND k = ?
-			AND t.date >= date('now', ? || ' days')
-			ORDER BY vm.distance ASC
-			LIMIT ?
-		)
-		SELECT * FROM vec_matches
-	`
-
-	// Run text search query with more flexible matching
-	textQuery := `
-		WITH text_matches AS (
-			SELECT
-				t.date, t.amount, t.payee,
-				t.type, t.merchant, t.location, t.details_category as category, t.description, t.card_number,
-				t.foreign_amount, t.foreign_currency,
-				t.transfer_to_account, t.transfer_from_account, t.transfer_reference,
-				rank as text_score,
-				row_number() OVER (ORDER BY rank DESC) as text_rank
-			FROM transactions t
-			JOIN transactions_fts fts ON t.rowid = fts.rowid
-			WHERE fts.search_body MATCH ? || '*'
-			AND t.date >= date('now', ? || ' days')
-			ORDER BY rank DESC
-			LIMIT ?
-		)
-		SELECT * FROM text_matches
-	`
-
-	// Execute both queries in parallel using goroutines
-	var vectorResults, textResults []types.TransactionSearchResult
-	var vectorErr, textErr error
 
 	// Create a wait group for parallel execution
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// Channel to collect results and errors
+	vectorResults := make(chan []types.TransactionSearchResult, 1)
+	textResults := make(chan []types.TransactionSearchResult, 1)
+	vectorErr := make(chan error, 1)
+	textErr := make(chan error, 1)
+
 	// Run vector search
 	go func() {
 		defer wg.Done()
-		rows, err := d.db.QueryContext(ctx, vectorQuery, embedding, limit, -days, limit)
+		results, err := d.runVectorSearch(ctx, embedding, days, limit)
 		if err != nil {
-			vectorErr = fmt.Errorf("vector search failed: %w", err)
+			vectorErr <- err
 			return
 		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var result types.TransactionSearchResult
-			var t = &result.TransactionWithDetails
-			var date time.Time
-			var amount decimal.Decimal
-			var foreignAmount sql.NullFloat64
-			var foreignCurrency sql.NullString
-			var transferToAccount sql.NullString
-			var transferFromAccount sql.NullString
-			var transferReference sql.NullString
-			var vectorScore float64
-			var vectorRank int
-
-			if err := rows.Scan(
-				&date,
-				&amount,
-				&t.Payee,
-				&t.Details.Type,
-				&t.Details.Merchant,
-				&t.Details.Location,
-				&t.Details.Category,
-				&t.Details.Description,
-				&t.Details.CardNumber,
-				&foreignAmount,
-				&foreignCurrency,
-				&transferToAccount,
-				&transferFromAccount,
-				&transferReference,
-				&vectorScore,
-				&vectorRank,
-			); err != nil {
-				vectorErr = fmt.Errorf("failed to scan vector result: %w", err)
-				return
-			}
-
-			// Format date and amount
-			t.Date = date.Format("02/01/2006")
-			t.Amount = amount.String()
-
-			// Set foreign amount if present
-			if foreignAmount.Valid && foreignCurrency.Valid {
-				t.Details.ForeignAmount = &struct {
-					Amount   decimal.Decimal `json:"amount"`
-					Currency string          `json:"currency"`
-				}{
-					Amount:   decimal.NewFromFloat(foreignAmount.Float64),
-					Currency: foreignCurrency.String,
-				}
-			}
-
-			// Set transfer details if present
-			if transferToAccount.Valid || transferFromAccount.Valid || transferReference.Valid {
-				t.Details.TransferDetails = &struct {
-					ToAccount   string `json:"to_account,omitempty"`
-					FromAccount string `json:"from_account,omitempty"`
-					Reference   string `json:"reference,omitempty"`
-				}{
-					ToAccount:   transferToAccount.String,
-					FromAccount: transferFromAccount.String,
-					Reference:   transferReference.String,
-				}
-			}
-
-			// Set vector score
-			result.Scores.VectorScore = vectorScore
-
-			vectorResults = append(vectorResults, result)
-		}
-
-		if err := rows.Err(); err != nil {
-			vectorErr = fmt.Errorf("error iterating vector results: %w", err)
-			return
-		}
+		vectorResults <- results
 	}()
 
 	// Run text search
 	go func() {
 		defer wg.Done()
-		rows, err := d.db.QueryContext(ctx, textQuery, query, -days, limit)
+		results, err := d.runTextSearch(ctx, query, days, limit)
 		if err != nil {
-			textErr = fmt.Errorf("text search failed: %w", err)
+			textErr <- err
 			return
 		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var result types.TransactionSearchResult
-			var t = &result.TransactionWithDetails
-			var date time.Time
-			var amount decimal.Decimal
-			var foreignAmount sql.NullFloat64
-			var foreignCurrency sql.NullString
-			var transferToAccount sql.NullString
-			var transferFromAccount sql.NullString
-			var transferReference sql.NullString
-			var textScore float64
-			var textRank int
-
-			if err := rows.Scan(
-				&result.Transaction.Date,
-				&amount,
-				&t.Payee,
-				&t.Details.Type,
-				&t.Details.Merchant,
-				&t.Details.Location,
-				&t.Details.Category,
-				&t.Details.Description,
-				&t.Details.CardNumber,
-				&foreignAmount,
-				&foreignCurrency,
-				&transferToAccount,
-				&transferFromAccount,
-				&transferReference,
-				&textScore,
-				&textRank,
-			); err != nil {
-				textErr = fmt.Errorf("failed to scan text result: %w", err)
-				return
-			}
-
-			// Format date and amount
-			t.Date = date.Format("02/01/2006")
-			t.Amount = amount.String()
-
-			// Set foreign amount if present
-			if foreignAmount.Valid && foreignCurrency.Valid {
-				t.Details.ForeignAmount = &struct {
-					Amount   decimal.Decimal `json:"amount"`
-					Currency string          `json:"currency"`
-				}{
-					Amount:   decimal.NewFromFloat(foreignAmount.Float64),
-					Currency: foreignCurrency.String,
-				}
-			}
-
-			// Set transfer details if present
-			if transferToAccount.Valid || transferFromAccount.Valid || transferReference.Valid {
-				t.Details.TransferDetails = &struct {
-					ToAccount   string `json:"to_account,omitempty"`
-					FromAccount string `json:"from_account,omitempty"`
-					Reference   string `json:"reference,omitempty"`
-				}{
-					ToAccount:   transferToAccount.String,
-					FromAccount: transferFromAccount.String,
-					Reference:   transferReference.String,
-				}
-			}
-
-			// Set text score
-			result.Scores.TextScore = textScore
-
-			textResults = append(textResults, result)
-		}
-
-		if err := rows.Err(); err != nil {
-			textErr = fmt.Errorf("error iterating text results: %w", err)
-			return
-		}
+		textResults <- results
 	}()
 
 	// Wait for both searches to complete
 	wg.Wait()
 
 	// Check for errors
-	if vectorErr != nil {
-		return nil, vectorErr
+	select {
+	case err := <-vectorErr:
+		return nil, fmt.Errorf("vector search failed: %w", err)
+	case err := <-textErr:
+		return nil, fmt.Errorf("text search failed: %w", err)
+	default:
 	}
-	if textErr != nil {
-		return nil, textErr
-	}
+
+	// Get results
+	vectorMatches := <-vectorResults
+	textMatches := <-textResults
 
 	// Combine results using RRF
 	transactionScores := make(map[string]*types.TransactionSearchResult)
 
 	// Process vector results
-	for _, result := range vectorResults {
+	for _, result := range vectorMatches {
 		id := generateTransactionID(result.Transaction)
 		if _, exists := transactionScores[id]; !exists {
 			transactionScores[id] = &result
@@ -861,7 +468,7 @@ func (d *DB) SearchTransactionsHybrid(ctx context.Context, query string, embeddi
 	}
 
 	// Process text results
-	for _, result := range textResults {
+	for _, result := range textMatches {
 		id := generateTransactionID(result.Transaction)
 		if existing, exists := transactionScores[id]; exists {
 			// Merge scores
@@ -894,6 +501,154 @@ func (d *DB) SearchTransactionsHybrid(ctx context.Context, query string, embeddi
 	}
 
 	return combinedResults, nil
+}
+
+// runVectorSearch performs a vector similarity search
+func (d *DB) runVectorSearch(ctx context.Context, embedding []byte, days int, limit int) ([]types.TransactionSearchResult, error) {
+	query := `
+		WITH vec_matches AS (
+			SELECT
+				rowid as transaction_id,
+				row_number() OVER (ORDER BY distance) as rank_number,
+				distance
+			FROM transactions_vec
+			WHERE embedding MATCH ? AND k = ?
+			AND rowid IN (
+				SELECT rowid FROM transactions
+				WHERE date >= date('now', ? || ' days')
+			)
+		)
+		SELECT
+			t.date, t.amount, t.payee, t.bank,
+			t.type, t.merchant, t.location, t.details_category, t.description, t.card_number,
+			t.foreign_amount, t.foreign_currency,
+			t.transfer_to_account, t.transfer_from_account, t.transfer_reference,
+			vm.distance
+		FROM vec_matches vm
+		JOIN transactions t ON t.rowid = vm.transaction_id
+		ORDER BY vm.rank_number ASC
+		LIMIT ?
+	`
+
+	rows, err := d.db.QueryContext(ctx, query, embedding, limit, -days, limit)
+	if err != nil {
+		return nil, fmt.Errorf("vector search failed: %w", err)
+	}
+	defer rows.Close()
+
+	var results []types.TransactionSearchResult
+	for rows.Next() {
+		var result types.TransactionSearchResult
+		var t = &result.TransactionWithDetails
+		var date time.Time
+		var amount decimal.Decimal
+		var foreignAmount sql.NullFloat64
+		var foreignCurrency sql.NullString
+		var transferToAccount sql.NullString
+		var transferFromAccount sql.NullString
+		var transferReference sql.NullString
+		var distance float64
+
+		if err := rows.Scan(
+			&date, &amount, &t.Payee, &t.Bank,
+			&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
+			&foreignAmount, &foreignCurrency,
+			&transferToAccount, &transferFromAccount, &transferReference,
+			&distance,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan transaction: %w", err)
+		}
+
+		// Format date and amount as strings
+		t.Date = date.Format("02/01/2006")
+		t.Amount = amount.String()
+
+		// Set foreign amount if present
+		setForeignAmount(t, foreignAmount, foreignCurrency)
+
+		// Set transfer details if present
+		setTransferDetails(t, transferToAccount, transferFromAccount, transferReference)
+
+		// Set vector score
+		result.Scores.VectorScore = distance
+
+		results = append(results, result)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating vector results: %w", err)
+	}
+
+	return results, nil
+}
+
+// runTextSearch performs a full-text search
+func (d *DB) runTextSearch(ctx context.Context, query string, days int, limit int) ([]types.TransactionSearchResult, error) {
+	searchQuery := `
+		SELECT
+			t.date, t.amount, t.payee, t.bank,
+			t.type, t.merchant, t.location, t.details_category, t.description, t.card_number,
+			t.foreign_amount, t.foreign_currency,
+			t.transfer_to_account, t.transfer_from_account, t.transfer_reference,
+			fts.rank
+		FROM transactions t
+		JOIN transactions_fts fts ON t.rowid = fts.rowid
+		WHERE fts.search_body MATCH ?
+		AND t.date >= date('now', ?)
+		ORDER BY fts.rank DESC
+		LIMIT ?
+	`
+
+	rows, err := d.db.QueryContext(ctx, searchQuery, query, fmt.Sprintf("%d days", -days), limit)
+	if err != nil {
+		return nil, fmt.Errorf("text search failed: %w", err)
+	}
+	defer rows.Close()
+
+	var results []types.TransactionSearchResult
+	for rows.Next() {
+		var result types.TransactionSearchResult
+		var t = &result.TransactionWithDetails
+		var date time.Time
+		var amount decimal.Decimal
+		var foreignAmount sql.NullFloat64
+		var foreignCurrency sql.NullString
+		var transferToAccount sql.NullString
+		var transferFromAccount sql.NullString
+		var transferReference sql.NullString
+		var rank float64
+
+		if err := rows.Scan(
+			&date, &amount, &t.Payee, &t.Bank,
+			&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
+			&foreignAmount, &foreignCurrency,
+			&transferToAccount, &transferFromAccount, &transferReference,
+			&rank,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan transaction: %w", err)
+		}
+
+		// Format date and amount as strings
+		t.Date = date.Format("02/01/2006")
+		t.Amount = amount.String()
+
+		// Set foreign amount if present
+		setForeignAmount(t, foreignAmount, foreignCurrency)
+
+		// Set transfer details if present
+		setTransferDetails(t, transferToAccount, transferFromAccount, transferReference)
+
+		// Set text score
+		result.Scores.TextScore = rank
+
+		results = append(results, result)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating text results: %w", err)
+	}
+
+	return results, nil
 }
 
 // SerializeEmbedding serializes a float32 vector for sqlite-vec
@@ -948,4 +703,98 @@ func (d *DB) GetCategories(ctx context.Context, days int) ([]CategoryCount, erro
 	}
 
 	return categories, nil
+}
+
+// scanTransactionRow scans a transaction row into a TransactionWithDetails struct
+func scanTransactionRow(rows *sql.Rows, t *types.TransactionWithDetails) error {
+	var date time.Time
+	var amount decimal.Decimal
+	var foreignAmount sql.NullFloat64
+	var foreignCurrency sql.NullString
+	var transferToAccount sql.NullString
+	var transferFromAccount sql.NullString
+	var transferReference sql.NullString
+
+	if err := rows.Scan(
+		&date, &amount, &t.Payee, &t.Bank,
+		&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
+		&foreignAmount, &foreignCurrency,
+		&transferToAccount, &transferFromAccount, &transferReference,
+	); err != nil {
+		return fmt.Errorf("failed to scan transaction: %w", err)
+	}
+
+	// Format date and amount as strings
+	t.Date = date.Format("02/01/2006")
+	t.Amount = amount.String()
+
+	// Set foreign amount if present
+	setForeignAmount(t, foreignAmount, foreignCurrency)
+
+	// Set transfer details if present
+	setTransferDetails(t, transferToAccount, transferFromAccount, transferReference)
+
+	return nil
+}
+
+// setForeignAmount sets the foreign amount details on a transaction if present
+func setForeignAmount(t *types.TransactionWithDetails, amount sql.NullFloat64, currency sql.NullString) {
+	if amount.Valid && currency.Valid {
+		t.Details.ForeignAmount = &struct {
+			Amount   decimal.Decimal `json:"amount"`
+			Currency string          `json:"currency"`
+		}{
+			Amount:   decimal.NewFromFloat(amount.Float64),
+			Currency: currency.String,
+		}
+	}
+}
+
+// setTransferDetails sets the transfer details on a transaction if present
+func setTransferDetails(t *types.TransactionWithDetails, toAccount, fromAccount, reference sql.NullString) {
+	if toAccount.Valid || fromAccount.Valid || reference.Valid {
+		t.Details.TransferDetails = &struct {
+			ToAccount   string `json:"to_account,omitempty"`
+			FromAccount string `json:"from_account,omitempty"`
+			Reference   string `json:"reference,omitempty"`
+		}{
+			ToAccount:   toAccount.String,
+			FromAccount: fromAccount.String,
+			Reference:   reference.String,
+		}
+	}
+}
+
+// SearchTransactionsByVector searches for transactions using vector similarity
+func (d *DB) SearchTransactionsByVector(ctx context.Context, embedding []byte, days int, limit int) ([]types.TransactionWithDetails, error) {
+	// Use runVectorSearch to get the results
+	results, err := d.runVectorSearch(ctx, embedding, days, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert to TransactionWithDetails
+	transactions := make([]types.TransactionWithDetails, len(results))
+	for i, result := range results {
+		transactions[i] = result.TransactionWithDetails
+	}
+
+	return transactions, nil
+}
+
+// SearchTransactionsByText performs a full-text search on transactions
+func (d *DB) SearchTransactionsByText(ctx context.Context, query string, days int, limit int) ([]types.TransactionWithDetails, error) {
+	// Use runTextSearch to get the results
+	results, err := d.runTextSearch(ctx, query, days, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert to TransactionWithDetails
+	transactions := make([]types.TransactionWithDetails, len(results))
+	for i, result := range results {
+		transactions[i] = result.TransactionWithDetails
+	}
+
+	return transactions, nil
 }
