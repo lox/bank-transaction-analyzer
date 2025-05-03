@@ -155,7 +155,7 @@ func createTables(db *sql.DB) error {
 // Store stores a transaction and its details in the database
 func (d *DB) Store(ctx context.Context, t types.Transaction, details *types.TransactionDetails) error {
 	// Generate transaction ID
-	id := generateTransactionID(t)
+	id := GenerateTransactionID(t)
 	d.logger.Debug("Storing transaction", "id", id, "date", t.Date, "amount", t.Amount, "bank", t.Bank, "payee", t.Payee)
 
 	// Parse date from QIF format
@@ -213,7 +213,7 @@ func (d *DB) Store(ctx context.Context, t types.Transaction, details *types.Tran
 
 // Get retrieves transaction details from the database
 func (d *DB) Get(ctx context.Context, t types.Transaction) (*types.TransactionDetails, error) {
-	id := generateTransactionID(t)
+	id := GenerateTransactionID(t)
 
 	var details types.TransactionDetails
 	var date time.Time
@@ -269,8 +269,8 @@ func (d *DB) Get(ctx context.Context, t types.Transaction) (*types.TransactionDe
 	return &details, nil
 }
 
-// generateTransactionID creates a unique ID for a transaction based on payee, amount, and date
-func generateTransactionID(t types.Transaction) string {
+// GenerateTransactionID creates a unique ID for a transaction based on payee, amount, and date
+func GenerateTransactionID(t types.Transaction) string {
 	// Create a hash of the transaction details
 	h := sha256.New()
 	h.Write([]byte(fmt.Sprintf("%s|%s|%s|%s", t.Payee, t.Amount, t.Date, t.Bank)))
@@ -333,7 +333,7 @@ func (d *DB) FilterExistingTransactions(ctx context.Context, transactions []type
 
 // Has checks if a transaction exists in the database
 func (d *DB) Has(ctx context.Context, t types.Transaction) (bool, error) {
-	id := generateTransactionID(t)
+	id := GenerateTransactionID(t)
 
 	var exists bool
 	err := d.db.QueryRowContext(ctx, `
@@ -461,7 +461,7 @@ func (d *DB) SearchTransactions(ctx context.Context, query string, embedding []b
 
 	// Process vector results
 	for _, result := range vectorMatches {
-		id := generateTransactionID(result.Transaction)
+		id := GenerateTransactionID(result.Transaction)
 		if _, exists := transactionScores[id]; !exists {
 			transactionScores[id] = &result
 		}
@@ -469,7 +469,7 @@ func (d *DB) SearchTransactions(ctx context.Context, query string, embedding []b
 
 	// Process text results
 	for _, result := range textMatches {
-		id := generateTransactionID(result.Transaction)
+		id := GenerateTransactionID(result.Transaction)
 		if existing, exists := transactionScores[id]; exists {
 			// Merge scores
 			existing.Scores.TextScore = result.Scores.TextScore

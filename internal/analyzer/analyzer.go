@@ -2,9 +2,7 @@ package analyzer
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -90,6 +88,11 @@ func NewAnalyzer(client *openai.Client, logger *log.Logger, db *db.DB) (*Analyze
 	}, nil
 }
 
+// DB returns the database connection
+func (a *Analyzer) DB() *db.DB {
+	return a.db
+}
+
 // AnalyzeTransactions processes transactions in parallel and stores their details
 func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types.Transaction, config Config) ([]AnalyzedTransaction, error) {
 	startTime := time.Now()
@@ -114,12 +117,10 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 		progress = NewBarProgress(len(filteredTransactions))
 	}
 
-	analyzedTransactions := make([]AnalyzedTransaction, len(transactions))
+	// Initialize result slice with capacity for all transactions
+	analyzedTransactions := make([]AnalyzedTransaction, 0, len(transactions))
 
-	// Process transactions in parallel
-	g, gCtx := errgroup.WithContext(ctx)
-	g.SetLimit(config.Concurrency)
-
+	// First, get all existing transactions
 	for _, t := range transactions {
 		exists, err := a.db.Has(ctx, t)
 		if err != nil {
@@ -134,9 +135,14 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 				Transaction: t,
 				Details:     analyzed,
 			})
-			continue
 		}
+	}
 
+	// Process new transactions in parallel
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(config.Concurrency)
+
+	for _, t := range filteredTransactions {
 		t := t // Create new variable for the goroutine
 		g.Go(func() error {
 			// Check if context is canceled before starting
@@ -162,11 +168,6 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 				"payee", t.Payee,
 				"duration", time.Since(analysisStart))
 
-			analyzedTransactions = append(analyzedTransactions, AnalyzedTransaction{
-				Transaction: t,
-				Details:     details,
-			})
-
 			// Store transaction details
 			storeStart := time.Now()
 			if err := a.storeWithEmbedding(gCtx, t, details); err != nil {
@@ -183,6 +184,12 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 			a.logger.Debug("Transaction storage completed",
 				"payee", t.Payee,
 				"duration", time.Since(storeStart))
+
+			// Add to results
+			analyzedTransactions = append(analyzedTransactions, AnalyzedTransaction{
+				Transaction: t,
+				Details:     details,
+			})
 
 			// Update progress
 			if err := progress.Add(1); err != nil {
@@ -445,14 +452,6 @@ Return the information in JSON format with these fields:
 	return details, nil
 }
 
-// generateTransactionID creates a unique ID for a transaction based on payee, amount, and date
-func generateTransactionID(t types.Transaction) string {
-	// Create a hash of the transaction details
-	h := sha256.New()
-	h.Write([]byte(fmt.Sprintf("%s|%s|%s", t.Payee, t.Amount, t.Date)))
-	return hex.EncodeToString(h.Sum(nil))[:8]
-}
-
 // Store stores a transaction and its details in the database
 func (a *Analyzer) storeWithEmbedding(ctx context.Context, t types.Transaction, details *types.TransactionDetails) error {
 	startTime := time.Now()
@@ -487,7 +486,7 @@ func (a *Analyzer) storeWithEmbedding(ctx context.Context, t types.Transaction, 
 
 	// Store transaction details
 	storeStart := time.Now()
-	id := generateTransactionID(t)
+	id := db.GenerateTransactionID(t)
 	date, dateErr := time.ParseInLocation("02/01/2006", t.Date, time.Local)
 	if dateErr != nil {
 		return fmt.Errorf("failed to parse transaction date: %v", dateErr)

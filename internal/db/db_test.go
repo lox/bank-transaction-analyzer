@@ -205,3 +205,103 @@ func TestHasTransaction(t *testing.T) {
 		t.Error("expected transaction to exist")
 	}
 }
+
+func TestTransactionIDConsistency(t *testing.T) {
+	// Create two identical transactions
+	t1 := types.Transaction{
+		Date:   "01/01/2023",
+		Amount: "100.00",
+		Payee:  "Test Store",
+		Bank:   "Test Bank",
+	}
+	t2 := types.Transaction{
+		Date:   "01/01/2023",
+		Amount: "100.00",
+		Payee:  "Test Store",
+		Bank:   "Test Bank",
+	}
+
+	// Generate IDs for both transactions
+	id1 := GenerateTransactionID(t1)
+	id2 := GenerateTransactionID(t2)
+
+	// IDs should be identical for identical transactions
+	if id1 != id2 {
+		t.Errorf("expected identical transaction IDs, got %q and %q", id1, id2)
+	}
+
+	// Create a slightly different transaction
+	t3 := types.Transaction{
+		Date:   "01/01/2023",
+		Amount: "100.00",
+		Payee:  "Test Store",
+		Bank:   "Different Bank", // Only difference is the bank
+	}
+
+	// Generate ID for the different transaction
+	id3 := GenerateTransactionID(t3)
+
+	// ID should be different for different transactions
+	if id1 == id3 {
+		t.Errorf("expected different transaction IDs for different transactions, got identical IDs")
+	}
+}
+
+func TestFilterExistingTransactions(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create some test transactions
+	transactions := []types.Transaction{
+		{
+			Date:   "01/01/2023",
+			Amount: "100.00",
+			Payee:  "Test Store 1",
+			Bank:   "Test Bank",
+		},
+		{
+			Date:   "02/01/2023",
+			Amount: "200.00",
+			Payee:  "Test Store 2",
+			Bank:   "Test Bank",
+		},
+		{
+			Date:   "03/01/2023",
+			Amount: "300.00",
+			Payee:  "Test Store 3",
+			Bank:   "Test Bank",
+		},
+	}
+
+	// Store the first two transactions
+	for i := 0; i < 2; i++ {
+		details := &types.TransactionDetails{
+			Type:        "purchase",
+			Merchant:    transactions[i].Payee,
+			Category:    "Shopping",
+			Description: "Test purchase",
+			SearchBody:  transactions[i].Payee + " Test purchase",
+		}
+		if err := db.Store(ctx, transactions[i], details); err != nil {
+			t.Fatalf("failed to store transaction %d: %v", i, err)
+		}
+	}
+
+	// Filter the transactions
+	filtered, err := db.FilterExistingTransactions(ctx, transactions)
+	if err != nil {
+		t.Fatalf("failed to filter transactions: %v", err)
+	}
+
+	// Should only have one transaction (the third one)
+	if len(filtered) != 1 {
+		t.Errorf("expected 1 filtered transaction, got %d", len(filtered))
+	}
+
+	// The remaining transaction should be the third one
+	if filtered[0].Payee != transactions[2].Payee {
+		t.Errorf("expected filtered transaction to be %q, got %q", transactions[2].Payee, filtered[0].Payee)
+	}
+}
