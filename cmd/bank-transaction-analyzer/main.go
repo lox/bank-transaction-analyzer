@@ -11,24 +11,23 @@ import (
 	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
 	"github.com/lox/bank-transaction-analyzer/internal/bank"
 	"github.com/lox/bank-transaction-analyzer/internal/bank/ing"
+	"github.com/lox/bank-transaction-analyzer/internal/commands"
 	"github.com/lox/bank-transaction-analyzer/internal/db"
+	"github.com/lox/bank-transaction-analyzer/internal/types"
 	openrouter "github.com/revrost/go-openrouter"
 )
 
-type GlobalFlags struct {
-	DataDir         string `help:"Path to data directory" default:"./data"`
-	OpenRouterKey   string `help:"OpenRouter API key" env:"OPENROUTER_API_KEY" required:""`
-	OpenRouterModel string `help:"OpenRouter model to use for analysis" default:"openai/gpt-4.1" env:"OPENROUTER_MODEL"`
-	Concurrency     int    `help:"Number of concurrent transactions to process" default:"5"`
-	LogLevel        string `help:"Log level (debug, info, warn, error)" default:"warn" enum:"debug,info,warn,error"`
-	NoProgress      bool   `help:"Disable progress bar" default:"false"`
-	Timezone        string `help:"Timezone to use for transaction dates" required:"" default:"Australia/Melbourne"`
-	Bank            string `help:"Bank to use for processing" default:"ing-australia" enum:"ing-australia"`
-}
-
 type CLI struct {
-	GlobalFlags
-	QIFFile string `help:"Path to QIF file to process" required:""`
+	commands.CommonConfig
+	commands.EmbeddingConfig
+
+	OpenRouterKey    string `help:"OpenRouter API key" env:"OPENROUTER_API_KEY" required:""`
+	OpenRouterModel  string `help:"OpenRouter model to use for analysis" default:"google/gemini-2.5-flash-preview" env:"OPENROUTER_MODEL"`
+	Concurrency      int    `help:"Number of concurrent operations to process" default:"10"`
+	NoProgress       bool   `help:"Disable progress bar" default:"false"`
+	Bank             string `help:"Bank to use for processing" default:"ing-australia" enum:"ing-australia"`
+	QIFFile          string `help:"Path to QIF file to process" required:""`
+	UpdateEmbeddings bool   `help:"Update embeddings for all transactions after processing" default:"false"`
 }
 
 func (c *CLI) Run() error {
@@ -40,13 +39,6 @@ func (c *CLI) Run() error {
 		logger.Fatal("Invalid log level", "error", err)
 	}
 	logger.SetLevel(level)
-
-	// Initialize OpenRouter client
-	client := openrouter.NewClient(
-		c.OpenRouterKey,
-		openrouter.WithXTitle("Bank Transaction Analyzer"),
-		openrouter.WithHTTPReferer("https://github.com/lox/bank-transaction-analyzer"),
-	)
 
 	// Load timezone
 	loc, err := time.LoadLocation(c.Timezone)
@@ -60,6 +52,17 @@ func (c *CLI) Run() error {
 		logger.Fatal("Failed to initialize database", "error", err)
 	}
 	defer database.Close()
+
+	// Create context with timeout for operations
+	processCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	// Initialize OpenRouter client for transaction analysis
+	client := openrouter.NewClient(
+		c.OpenRouterKey,
+		openrouter.WithXTitle("Bank Transaction Analyzer"),
+		openrouter.WithHTTPReferer("https://github.com/lox/bank-transaction-analyzer"),
+	)
 
 	// Initialize bank registry
 	registry := bank.NewRegistry()
@@ -84,18 +87,14 @@ func (c *CLI) Run() error {
 		logger.Fatal("Failed to parse transactions", "error", err)
 	}
 
-	// Process transactions
-	processCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	defer cancel()
-
-	// Create analyzer
-	an, err := analyzer.NewAnalyzer(client, logger, database)
+	// Initialize embedding provider and vector storage
+	an, err := initAnalyzer(processCtx, c, client, database, logger)
 	if err != nil {
-		logger.Fatal("Failed to create analyzer", "error", err)
+		return err
 	}
 
 	// Process transactions
-	_, err = bankImpl.ProcessTransactions(processCtx, transactions, an, analyzer.Config{
+	analyzedTransactions, err := bankImpl.ProcessTransactions(processCtx, transactions, an, analyzer.Config{
 		OpenRouterModel: c.OpenRouterModel,
 		Concurrency:     c.Concurrency,
 		Progress:        !c.NoProgress,
@@ -104,11 +103,67 @@ func (c *CLI) Run() error {
 		logger.Fatal("Failed to process transactions", "error", err)
 	}
 
+	logger.Info("Transactions processed successfully", "count", len(analyzedTransactions))
+
+	// Update embeddings if requested
+	if c.UpdateEmbeddings {
+		transactionsNeedingUpdate := make([]types.TransactionWithDetails, 0)
+		for _, t := range analyzedTransactions {
+			hasEmbedding, err := an.HasTransactionEmbedding(processCtx, &t)
+			if err != nil {
+				logger.Fatal("Failed to check if transaction embedding exists", "error", err)
+				return err
+			}
+			if !hasEmbedding {
+				transactionsNeedingUpdate = append(transactionsNeedingUpdate, t)
+			}
+		}
+		logger.Info("Updating embeddings for transactions without embeddings", "count", len(transactionsNeedingUpdate))
+		err = an.UpdateEmbeddings(processCtx, transactionsNeedingUpdate, analyzer.Config{
+			Concurrency: c.Concurrency,
+			Progress:    !c.NoProgress,
+		})
+		if err != nil {
+			logger.Fatal("Failed to update embeddings", "error", err)
+			return err
+		}
+
+		logger.Info("Embeddings updated successfully")
+	}
+
 	return nil
 }
 
+// Initialize the analyzer with the embedding provider and vector storage
+func initAnalyzer(ctx context.Context, config *CLI, client *openrouter.Client, database *db.DB, logger *log.Logger) (*analyzer.Analyzer, error) {
+	// Initialize embedding provider using the common setup
+	embeddingOptions := commands.EmbeddingOptions{
+		Provider:      config.Provider,
+		LlamaCppModel: config.LlamaCppModel,
+		GeminiAPIKey:  config.GeminiAPIKey,
+		// For Gemini, we can use the OpenRouterModel as the GeminiModel if desired
+		Logger: logger,
+	}
+
+	embeddingProvider, err := commands.SetupEmbeddingProvider(ctx, embeddingOptions)
+	if err != nil {
+		logger.Fatal("Failed to initialize embedding provider", "error", err)
+		return nil, err
+	}
+
+	// Initialize vector storage
+	vectorStorage, err := commands.SetupVectorStorage(ctx, config.DataDir, embeddingProvider, logger)
+	if err != nil {
+		logger.Fatal("Failed to create vector storage", "error", err)
+		return nil, err
+	}
+
+	// Create analyzer with all the required dependencies
+	return analyzer.NewAnalyzer(client, logger, database, embeddingProvider, vectorStorage), nil
+}
+
 func main() {
-	// Normal Kong CLI handling
+	// Parse CLI commands
 	var cli CLI
 	ctx := kong.Parse(&cli,
 		kong.Name("bank-transaction-analyzer"),
@@ -116,6 +171,7 @@ func main() {
 		kong.UsageOnError(),
 	)
 
+	// Run the selected command
 	err := ctx.Run()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

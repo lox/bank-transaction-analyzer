@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"testing"
@@ -285,5 +286,111 @@ func TestFilterExistingTransactions(t *testing.T) {
 	// The remaining transaction should be the third one
 	if filtered[0].Payee != transactions[2].Payee {
 		t.Errorf("expected filtered transaction to be %q, got %q", transactions[2].Payee, filtered[0].Payee)
+	}
+}
+
+func TestGetTransactionsWithPagination(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert 10 test transactions with sequential dates
+	for i := 0; i < 10; i++ {
+		// Create transaction with date as today - i days
+		date := time.Now().AddDate(0, 0, -i)
+		transaction := types.Transaction{
+			Date:   date.Format("02/01/2006"),
+			Amount: fmt.Sprintf("%d.00", 100+i), // Different amounts to verify ordering
+			Payee:  fmt.Sprintf("Test Store %d", i),
+			Bank:   "Test Bank",
+		}
+
+		details := &types.TransactionDetails{
+			Type:        "purchase",
+			Merchant:    fmt.Sprintf("Store %d", i),
+			Location:    fmt.Sprintf("Location %d", i),
+			Category:    "Shopping",
+			Description: fmt.Sprintf("Test purchase %d", i),
+		}
+
+		if err := db.Store(ctx, transaction, details); err != nil {
+			t.Fatalf("failed to store transaction: %v", err)
+		}
+	}
+
+	// Test GetTransactions with various limit and offset combinations
+	testCases := []struct {
+		name     string
+		limit    int
+		offset   int
+		expected int // expected number of results
+	}{
+		{
+			name:     "No limit or offset",
+			limit:    0,
+			offset:   0,
+			expected: 10,
+		},
+		{
+			name:     "Limit only",
+			limit:    5,
+			offset:   0,
+			expected: 5,
+		},
+		{
+			name:     "Offset only",
+			limit:    0,
+			offset:   5, // Should be ignored without a limit
+			expected: 10,
+		},
+		{
+			name:     "Limit and offset",
+			limit:    3,
+			offset:   2,
+			expected: 3,
+		},
+		{
+			name:     "Offset beyond results",
+			limit:    10,
+			offset:   20,
+			expected: 0,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			transactions, err := db.GetTransactions(ctx, 30, tc.limit, tc.offset)
+			if err != nil {
+				t.Fatalf("Failed to get transactions: %v", err)
+			}
+
+			if len(transactions) != tc.expected {
+				t.Errorf("Expected %d transactions, got %d", tc.expected, len(transactions))
+			}
+
+			// If we have at least 2 results, verify they're sorted by date (most recent first)
+			if len(transactions) >= 2 {
+				for i := 0; i < len(transactions)-1; i++ {
+					date1, _ := time.Parse("02/01/2006", transactions[i].Date)
+					date2, _ := time.Parse("02/01/2006", transactions[i+1].Date)
+					if date1.Before(date2) {
+						t.Errorf("Transactions not sorted by date: %s before %s",
+							transactions[i].Date, transactions[i+1].Date)
+					}
+				}
+			}
+
+			// When using both limit and offset, check specific expected records
+			if tc.limit > 0 && tc.offset > 0 && len(transactions) > 0 {
+				// We expect to get records starting from offset position
+				// The most recent date is at index 0, so offset 2 means we expect Store 2, 3, 4...
+				expectedStartId := tc.offset
+				if transactions[0].Details.Merchant != fmt.Sprintf("Store %d", expectedStartId) {
+					t.Errorf("Expected first record to be Store %d, got %s",
+						expectedStartId, transactions[0].Details.Merchant)
+				}
+			}
+		})
 	}
 }

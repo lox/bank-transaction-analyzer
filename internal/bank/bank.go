@@ -17,7 +17,7 @@ type Bank interface {
 	ParseTransactions(ctx context.Context, r io.Reader) ([]types.Transaction, error)
 
 	// ProcessTransactions processes transactions using the analyzer
-	ProcessTransactions(ctx context.Context, transactions []types.Transaction, an *analyzer.Analyzer, config analyzer.Config) ([]analyzer.AnalyzedTransaction, error)
+	ProcessTransactions(ctx context.Context, transactions []types.Transaction, an *analyzer.Analyzer, config analyzer.Config) ([]types.TransactionWithDetails, error)
 }
 
 // Registry maintains a list of available bank implementations

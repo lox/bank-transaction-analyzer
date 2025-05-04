@@ -46,7 +46,7 @@ func (i *ING) ParseTransactions(ctx context.Context, r io.Reader) ([]types.Trans
 }
 
 // ProcessTransactions processes transactions using the analyzer
-func (i *ING) ProcessTransactions(ctx context.Context, transactions []types.Transaction, an *analyzer.Analyzer, config analyzer.Config) ([]analyzer.AnalyzedTransaction, error) {
+func (i *ING) ProcessTransactions(ctx context.Context, transactions []types.Transaction, an *analyzer.Analyzer, config analyzer.Config) ([]types.TransactionWithDetails, error) {
 	return an.AnalyzeTransactions(ctx, transactions, config)
 }
 

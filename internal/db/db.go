@@ -341,8 +341,56 @@ func (d *DB) Close() error {
 	return d.db.Close()
 }
 
+// GetTransactionByID retrieves a transaction by its ID
+func (d *DB) GetTransactionByID(ctx context.Context, id string) (*types.TransactionWithDetails, error) {
+	query := `
+		SELECT t.date, t.amount, t.payee, t.bank,
+			t.type, t.merchant, t.location, t.details_category, t.description, t.card_number,
+			t.foreign_amount, t.foreign_currency,
+			t.transfer_to_account, t.transfer_from_account, t.transfer_reference
+		FROM transactions t
+		WHERE t.id = ?
+	`
+
+	var t types.TransactionWithDetails
+	row := d.db.QueryRowContext(ctx, query, id)
+
+	var date time.Time
+	var amount decimal.Decimal
+	var foreignAmount sql.NullFloat64
+	var foreignCurrency sql.NullString
+	var transferToAccount sql.NullString
+	var transferFromAccount sql.NullString
+	var transferReference sql.NullString
+
+	if err := row.Scan(
+		&date, &amount, &t.Payee, &t.Bank,
+		&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
+		&foreignAmount, &foreignCurrency,
+		&transferToAccount, &transferFromAccount, &transferReference,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("transaction with ID %s not found", id)
+		}
+		return nil, fmt.Errorf("failed to scan transaction: %w", err)
+	}
+
+	// Format date and amount as strings
+	t.Date = date.Format("02/01/2006")
+	t.Amount = amount.String()
+
+	// Set foreign amount if present
+	setForeignAmount(&t, foreignAmount, foreignCurrency)
+
+	// Set transfer details if present
+	setTransferDetails(&t, transferToAccount, transferFromAccount, transferReference)
+
+	return &t, nil
+}
+
 // GetTransactions returns transactions with details from the last N days
-func (d *DB) GetTransactions(ctx context.Context, days int) ([]types.TransactionWithDetails, error) {
+// with optional limit and offset for pagination
+func (d *DB) GetTransactions(ctx context.Context, days int, limit int, offset int) ([]types.TransactionWithDetails, error) {
 	query := `
 		SELECT t.date, t.amount, t.payee, t.bank,
 			t.type, t.merchant, t.location, t.details_category, t.description, t.card_number,
@@ -352,6 +400,14 @@ func (d *DB) GetTransactions(ctx context.Context, days int) ([]types.Transaction
 		WHERE t.date >= date('now', ? || ' days')
 		ORDER BY t.date DESC
 	`
+
+	// Add limit and offset if provided
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+		if offset > 0 {
+			query += fmt.Sprintf(" OFFSET %d", offset)
+		}
+	}
 
 	rows, err := d.db.QueryContext(ctx, query, -days)
 	if err != nil {

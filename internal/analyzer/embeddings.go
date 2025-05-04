@@ -12,12 +12,17 @@ import (
 
 	"github.com/avast/retry-go/v4"
 	"github.com/charmbracelet/log"
+	"github.com/google/generative-ai-go/genai"
+	"google.golang.org/api/option"
 )
 
 // EmbeddingProvider is an interface for generating embeddings from text
 type EmbeddingProvider interface {
 	// GenerateEmbedding generates a vector embedding for the given text
 	GenerateEmbedding(ctx context.Context, text string) ([]float32, error)
+
+	// GetEmbeddingModelName returns the name of the embedding model (e.g. "gemini-embedding-exp-03-07")
+	GetEmbeddingModelName() string
 }
 
 // LlamaCppConfig holds configuration for the llama.cpp embedding server
@@ -28,6 +33,8 @@ type LlamaCppConfig struct {
 	Timeout time.Duration
 	// RetryAttempts is the number of times to retry failed requests
 	RetryAttempts uint
+	// ModelName is the name of the specific model used by llama.cpp (e.g., "snowflake-arctic-embed-l-v2.0-f16")
+	ModelName string
 	// Logger is used for logging embedding operations
 	Logger *log.Logger
 }
@@ -59,6 +66,12 @@ func (c LlamaCppConfig) WithRetryAttempts(attempts uint) LlamaCppConfig {
 	return c
 }
 
+// WithModelName sets the model name for the llama.cpp server
+func (c LlamaCppConfig) WithModelName(modelName string) LlamaCppConfig {
+	c.ModelName = modelName
+	return c
+}
+
 // WithLogger sets the logger for embedding operations
 func (c LlamaCppConfig) WithLogger(logger *log.Logger) LlamaCppConfig {
 	c.Logger = logger
@@ -75,6 +88,9 @@ func (c LlamaCppConfig) Validate() error {
 	}
 	if c.RetryAttempts == 0 {
 		return fmt.Errorf("retry attempts must be greater than 0")
+	}
+	if c.ModelName == "" {
+		return fmt.Errorf("model name is required")
 	}
 	if c.Logger == nil {
 		return fmt.Errorf("logger is required")
@@ -205,4 +221,158 @@ func (p *LlamaCppEmbeddingProvider) GenerateEmbedding(ctx context.Context, text 
 		"embedding_index", embeddings[0].Index)
 
 	return embedding, nil
+}
+
+// GetEmbeddingModelName returns the name of the embedding model
+func (p *LlamaCppEmbeddingProvider) GetEmbeddingModelName() string {
+	return p.config.ModelName
+}
+
+// GeminiConfig holds configuration for the Gemini embedding service
+type GeminiConfig struct {
+	// APIKey is the Gemini API key
+	APIKey string
+	// ModelName is the name of the Gemini embedding model to use
+	ModelName string
+	// RetryAttempts is the number of times to retry failed requests
+	RetryAttempts uint
+	// Logger is used for logging embedding operations
+	Logger *log.Logger
+}
+
+// NewGeminiConfig creates a new configuration with default values
+func NewGeminiConfig() GeminiConfig {
+	return GeminiConfig{
+		RetryAttempts: 3,
+	}
+}
+
+// WithAPIKey sets the Gemini API key
+func (c GeminiConfig) WithAPIKey(apiKey string) GeminiConfig {
+	c.APIKey = apiKey
+	return c
+}
+
+// WithModelName sets the Gemini model name
+func (c GeminiConfig) WithModelName(modelName string) GeminiConfig {
+	c.ModelName = modelName
+	return c
+}
+
+// WithRetryAttempts sets the number of retry attempts
+func (c GeminiConfig) WithRetryAttempts(attempts uint) GeminiConfig {
+	c.RetryAttempts = attempts
+	return c
+}
+
+// WithLogger sets the logger for embedding operations
+func (c GeminiConfig) WithLogger(logger *log.Logger) GeminiConfig {
+	c.Logger = logger
+	return c
+}
+
+// Validate checks if the configuration is valid
+func (c GeminiConfig) Validate() error {
+	if c.APIKey == "" {
+		return fmt.Errorf("gemini api key is required")
+	}
+	if c.ModelName == "" {
+		return fmt.Errorf("model name is required")
+	}
+	if c.RetryAttempts == 0 {
+		return fmt.Errorf("retry attempts must be greater than 0")
+	}
+	if c.Logger == nil {
+		return fmt.Errorf("logger is required")
+	}
+	return nil
+}
+
+// GeminiEmbeddingProvider implements EmbeddingProvider using Google's Gemini API
+type GeminiEmbeddingProvider struct {
+	config GeminiConfig
+	client *genai.Client
+	model  *genai.EmbeddingModel
+	logger *log.Logger
+}
+
+// NewGeminiEmbeddingProvider creates a new Gemini embedding provider
+func NewGeminiEmbeddingProvider(ctx context.Context, config GeminiConfig) (*GeminiEmbeddingProvider, error) {
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
+	client, err := genai.NewClient(ctx, option.WithAPIKey(config.APIKey))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Gemini client: %w", err)
+	}
+
+	return &GeminiEmbeddingProvider{
+		config: config,
+		client: client,
+		model:  client.EmbeddingModel(config.ModelName),
+		logger: config.Logger,
+	}, nil
+}
+
+// GenerateEmbedding generates a vector embedding for the given text using Gemini API
+func (p *GeminiEmbeddingProvider) GenerateEmbedding(ctx context.Context, text string) ([]float32, error) {
+	var embedding []float32
+	var err error
+
+	start := time.Now()
+
+	// Retry logic for the embedding request
+	err = retry.Do(
+		func() error {
+			// Request embedding from Gemini API
+			result, err := p.model.EmbedContent(ctx, genai.Text(text))
+			if err != nil {
+				return fmt.Errorf("failed to generate embedding: %w", err)
+			}
+
+			if result == nil || result.Embedding == nil {
+				return fmt.Errorf("no embedding returned from Gemini API")
+			}
+
+			// Get the embedding values
+			embedding = result.Embedding.Values
+
+			return nil
+		},
+		retry.Context(ctx),
+		retry.Attempts(p.config.RetryAttempts),
+		retry.DelayType(retry.BackOffDelay),
+		retry.OnRetry(func(n uint, err error) {
+			p.logger.Warn("Retrying Gemini embedding request",
+				"attempt", n+1,
+				"max_attempts", p.config.RetryAttempts,
+				"error", err)
+		}),
+	)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get Gemini embedding: %w", err)
+	}
+
+	p.logger.Debug("Generated Gemini embedding",
+		"text_length", len(text),
+		"embedding_length", len(embedding),
+		"model", p.config.ModelName,
+		"duration", time.Since(start))
+
+	return embedding, nil
+}
+
+// Close closes the Gemini client
+func (p *GeminiEmbeddingProvider) Close() error {
+	if p.client != nil {
+		return p.client.Close()
+	}
+	return nil
+}
+
+// GetEmbeddingModelName returns the name of the embedding model
+func (p *GeminiEmbeddingProvider) GetEmbeddingModelName() string {
+	return p.config.ModelName
 }

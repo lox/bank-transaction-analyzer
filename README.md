@@ -82,7 +82,7 @@ After activating Hermit, the following commands are available in your PATH:
 #### Bank Transaction Analyzer
 
 ```bash
-bank-transaction-analyzer --qif-file Transactions.qif [options]
+bank-transaction-analyzer process --qif-file Transactions.qif [options]
 ```
 
 Options:
@@ -181,17 +181,35 @@ The tool implements a hybrid search system combining:
 
 ### Embeddings Generation
 
-The tool uses a local llama.cpp server for generating embeddings, running with:
+The tool supports multiple embedding providers:
 
-```bash
-build/bin/llama-server -m models/snowflake-arctic-embed-m-v1.5.d70deb40.f16.gguf --embeddings -c 768 -ngl 0
-```
+1. **Local llama.cpp Server**
+   - Default provider for local embedding generation
+   - Runs a local server with:
+   ```bash
+   build/bin/llama-server -m models/snowflake-arctic-embed-m-v1.5.d70deb40.f16.gguf --embeddings -c 768 -ngl 0
+   ```
+   - Uses the Snowflake Arctic Embed v1.5 model
+   - Generates 768-dimensional embeddings
+   - Runs on CPU (ngl 0)
+   - Optimized for embedding generation
 
-This configuration:
-- Uses the Snowflake Arctic Embed v1.5 model
-- Generates 768-dimensional embeddings
-- Runs on CPU (ngl 0)
-- Optimized for embedding generation
+2. **Google Gemini API**
+   - High-quality embeddings using Google's Gemini embedding model
+   - Supports 3K-dimension embeddings
+   - Provides better semantic understanding
+   - Requires a Gemini API key
+
+   To test Gemini embeddings:
+   ```bash
+   export GEMINI_API_KEY=your-gemini-api-key
+   bank-transaction-analyzer embed --text "Your text to embed"
+   ```
+
+   Options:
+   - `--text`: Text to generate embeddings for (required)
+   - `--model-name`: Gemini model to use (default: "gemini-embedding-exp-03-07")
+   - `--output-json`: Output as JSON
 
 The embeddings are stored in the `transactions_vec` virtual table and used for semantic search operations.
 
@@ -230,6 +248,9 @@ A: Currently ING Australia QIF format is supported, with plans to add support fo
 
 ### Q: How are transaction categories determined?
 A: Categories are extracted using language models via OpenRouter to analyze transaction descriptions and merchant information.
+
+### Q: Which embedding provider should I use?
+A: If you want the highest quality embeddings, use the Gemini API provider. If you prefer to keep everything local, use the llama.cpp server provider.
 
 ### Q: Is my transaction data secure?
 A: Not really, all data is stored locally in SQLite, unencrypted. No data is sent to external services except for OpenRouter API calls.

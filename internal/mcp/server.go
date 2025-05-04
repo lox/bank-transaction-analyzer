@@ -228,7 +228,8 @@ func (s *Server) listTransactionsHandler(ctx context.Context, request mcp.CallTo
 	txType, _ := request.Params.Arguments["type"].(string)
 	category, _ := request.Params.Arguments["category"].(string)
 
-	transactions, err := s.db.GetTransactions(ctx, days)
+	// Use GetTransactions with the limit parameter and 0 offset
+	transactions, err := s.db.GetTransactions(ctx, days, limit, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list transactions: %w", err)
 	}
@@ -245,11 +246,6 @@ func (s *Server) listTransactionsHandler(ctx context.Context, request mcp.CallTo
 			continue
 		}
 		filtered = append(filtered, t)
-	}
-
-	// Apply limit after filtering
-	if len(filtered) > limit {
-		filtered = filtered[:limit]
 	}
 
 	// Format transactions as text
