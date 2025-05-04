@@ -168,7 +168,7 @@ func (d *DB) Store(ctx context.Context, t types.Transaction, details *types.Tran
 	}
 
 	// Insert or replace transaction
-	result, err := d.db.ExecContext(ctx, `
+	_, err := d.db.ExecContext(ctx, `
 		INSERT OR REPLACE INTO transactions (
 			id, date, amount, payee, bank,
 			type, merchant, location, details_category, description, card_number, search_body,
@@ -183,32 +183,6 @@ func (d *DB) Store(ctx context.Context, t types.Transaction, details *types.Tran
 	)
 	if err != nil {
 		return fmt.Errorf("failed to store transaction: %v", err)
-	}
-
-	// Log the result of the insert/replace
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		d.logger.Warn("Failed to get rows affected", "error", err)
-	} else {
-		d.logger.Debug("Transaction stored", "id", id, "rows_affected", rowsAffected)
-	}
-
-	// Try to get the rowid after insert
-	var rowid int64
-	err = d.db.QueryRowContext(ctx, "SELECT rowid FROM transactions WHERE id = ?", id).Scan(&rowid)
-	if err != nil {
-		d.logger.Error("Failed to get rowid after insert", "id", id, "error", err)
-		return fmt.Errorf("failed to get transaction rowid: %v", err)
-	}
-	d.logger.Debug("Got rowid after insert", "id", id, "rowid", rowid)
-
-	// Check FTS status
-	var ftsRowid sql.NullInt64
-	err = d.db.QueryRowContext(ctx, "SELECT rowid FROM transactions_fts WHERE rowid = ?", rowid).Scan(&ftsRowid)
-	if err != nil {
-		d.logger.Warn("Failed to check FTS status", "id", id, "error", err)
-	} else {
-		d.logger.Debug("FTS status", "id", id, "fts_rowid", ftsRowid)
 	}
 
 	return nil

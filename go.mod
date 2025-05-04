@@ -1,15 +1,16 @@
 module github.com/lox/bank-transaction-analyzer
 
-go 1.24
+go 1.24.1
+
+toolchain go1.24.2
 
 require (
 	github.com/alecthomas/kong v0.9.0
-	github.com/asg017/sqlite-vec-go-bindings v0.1.6
 	github.com/avast/retry-go/v4 v4.6.1
 	github.com/charmbracelet/log v0.4.1
 	github.com/mark3labs/mcp-go v0.23.1
 	github.com/ncruces/go-sqlite3 v0.25.1
-	github.com/sashabaranov/go-openai v1.19.2
+	github.com/revrost/go-openrouter v0.0.0-20250414052218-c9123df8a97e
 	github.com/schollz/progressbar/v3 v3.14.2
 	github.com/shopspring/decimal v1.4.0
 	golang.org/x/sync v0.13.0

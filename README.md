@@ -1,12 +1,12 @@
 # Bank Transaction Analyzer
 
-A powerful tool for analyzing bank transactions using GPT-4.1 to extract structured information from transaction descriptions. Provides both CLI and MCP server interfaces for flexible access to your transaction data. Supports multiple banks, with ING Australia QIF exports supported initially.
+A powerful tool for analyzing bank transactions using language models via OpenRouter to extract structured information from transaction descriptions. Provides both CLI and MCP server interfaces for flexible access to your transaction data. Supports multiple banks, with ING Australia QIF exports supported initially.
 
 ## Features
 
 - **Transaction Analysis**
   - Multi-bank support with ING Australia QIF exports supported initially
-  - Extracts structured information using GPT-4.1
+  - Extracts structured information using models like GPT-4 via OpenRouter
   - Categorizes transactions automatically
   - Identifies merchants and locations
 
@@ -31,7 +31,7 @@ A powerful tool for analyzing bank transactions using GPT-4.1 to extract structu
 ### Prerequisites
 
 - Go 1.24 or later
-- OpenAI API key
+- OpenRouter API key
 - SQLite 3
 
 ### Using Hermit
@@ -56,9 +56,9 @@ After activating Hermit, the following commands are available in your PATH:
 ## Quick Start
 
 1. Export your transactions from your bank in QIF format (ING Australia QIF exports supported initially)
-2. Set up your OpenAI API key:
+2. Set up your OpenRouter API key:
    ```bash
-   export OPENAI_API_KEY=your-api-key
+   export OPENROUTER_API_KEY=your-api-key
    ```
 3. Run the analyzer:
    ```bash
@@ -88,8 +88,8 @@ bank-transaction-analyzer --qif-file Transactions.qif [options]
 Options:
 - `--qif-file`: Path to QIF file (required)
 - `--data-dir`: Data directory path (default: "./data")
-- `--openai-key`: OpenAI API key (can also use env var)
-- `--openai-model`: Model to use (default: "gpt-4.1")
+- `--openrouter-key`: OpenRouter API key (can also use env var)
+- `--openrouter-model`: Model to use (default: "openai/gpt-4.1")
 - `--concurrency`: Concurrent transactions to process (default: 5)
 - `--verbose`: Enable verbose logging
 - `--timezone`: Transaction timezone (default: "Australia/Melbourne")
@@ -118,7 +118,7 @@ Available tools:
 
 ### Environment Variables
 
-- `OPENAI_API_KEY`: Your OpenAI API key
+- `OPENROUTER_API_KEY`: Your OpenRouter API key
 - `DATA_DIR`: Path to data directory
 - `TZ`: Timezone for transaction dates
 
@@ -229,10 +229,10 @@ A: Run the analyzer again with the new QIF file. It will update existing transac
 A: Currently ING Australia QIF format is supported, with plans to add support for other banks and formats.
 
 ### Q: How are transaction categories determined?
-A: Categories are extracted using GPT-4.1 analysis of transaction descriptions and merchant information.
+A: Categories are extracted using language models via OpenRouter to analyze transaction descriptions and merchant information.
 
 ### Q: Is my transaction data secure?
-A: Not really, all data is stored locally in SQLite, unencrypted. No data is sent to external services except for OpenAI API calls.
+A: Not really, all data is stored locally in SQLite, unencrypted. No data is sent to external services except for OpenRouter API calls.
 
 ## License
 

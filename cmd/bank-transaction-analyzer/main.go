@@ -12,18 +12,18 @@ import (
 	"github.com/lox/bank-transaction-analyzer/internal/bank"
 	"github.com/lox/bank-transaction-analyzer/internal/bank/ing"
 	"github.com/lox/bank-transaction-analyzer/internal/db"
-	"github.com/sashabaranov/go-openai"
+	openrouter "github.com/revrost/go-openrouter"
 )
 
 type GlobalFlags struct {
-	DataDir     string `help:"Path to data directory" default:"./data"`
-	OpenAIKey   string `help:"OpenAI API key" env:"OPENAI_API_KEY" required:""`
-	OpenAIModel string `help:"OpenAI model to use for analysis" default:"gpt-4.1" env:"OPENAI_MODEL"`
-	Concurrency int    `help:"Number of concurrent transactions to process" default:"5"`
-	LogLevel    string `help:"Log level (debug, info, warn, error)" default:"warn" enum:"debug,info,warn,error"`
-	NoProgress  bool   `help:"Disable progress bar" default:"false"`
-	Timezone    string `help:"Timezone to use for transaction dates" required:"" default:"Australia/Melbourne"`
-	Bank        string `help:"Bank to use for processing" default:"ing-australia" enum:"ing-australia"`
+	DataDir         string `help:"Path to data directory" default:"./data"`
+	OpenRouterKey   string `help:"OpenRouter API key" env:"OPENROUTER_API_KEY" required:""`
+	OpenRouterModel string `help:"OpenRouter model to use for analysis" default:"openai/gpt-4.1" env:"OPENROUTER_MODEL"`
+	Concurrency     int    `help:"Number of concurrent transactions to process" default:"5"`
+	LogLevel        string `help:"Log level (debug, info, warn, error)" default:"warn" enum:"debug,info,warn,error"`
+	NoProgress      bool   `help:"Disable progress bar" default:"false"`
+	Timezone        string `help:"Timezone to use for transaction dates" required:"" default:"Australia/Melbourne"`
+	Bank            string `help:"Bank to use for processing" default:"ing-australia" enum:"ing-australia"`
 }
 
 type CLI struct {
@@ -41,8 +41,12 @@ func (c *CLI) Run() error {
 	}
 	logger.SetLevel(level)
 
-	// Initialize OpenAI client
-	client := openai.NewClient(c.OpenAIKey)
+	// Initialize OpenRouter client
+	client := openrouter.NewClient(
+		c.OpenRouterKey,
+		openrouter.WithXTitle("Bank Transaction Analyzer"),
+		openrouter.WithHTTPReferer("https://github.com/lox/bank-transaction-analyzer"),
+	)
 
 	// Load timezone
 	loc, err := time.LoadLocation(c.Timezone)
@@ -92,9 +96,9 @@ func (c *CLI) Run() error {
 
 	// Process transactions
 	_, err = bankImpl.ProcessTransactions(processCtx, transactions, an, analyzer.Config{
-		Model:       c.OpenAIModel,
-		Concurrency: c.Concurrency,
-		Progress:    !c.NoProgress,
+		OpenRouterModel: c.OpenRouterModel,
+		Concurrency:     c.Concurrency,
+		Progress:        !c.NoProgress,
 	})
 	if err != nil {
 		logger.Fatal("Failed to process transactions", "error", err)

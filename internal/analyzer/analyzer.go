@@ -11,18 +11,18 @@ import (
 	"github.com/charmbracelet/log"
 	"github.com/lox/bank-transaction-analyzer/internal/db"
 	"github.com/lox/bank-transaction-analyzer/internal/types"
-	"github.com/sashabaranov/go-openai"
+	openrouter "github.com/revrost/go-openrouter"
 	"golang.org/x/sync/errgroup"
 )
 
 type Config struct {
-	Model       string
-	Concurrency int
-	Progress    bool
+	OpenRouterModel string
+	Concurrency     int
+	Progress        bool
 }
 
 type Analyzer struct {
-	client     *openai.Client
+	client     *openrouter.Client
 	logger     *log.Logger
 	db         *db.DB
 	embeddings EmbeddingProvider
@@ -34,7 +34,7 @@ type AnalyzedTransaction struct {
 }
 
 // NewAnalyzer creates a new transaction parser
-func NewAnalyzer(client *openai.Client, logger *log.Logger, db *db.DB) (*Analyzer, error) {
+func NewAnalyzer(client *openrouter.Client, logger *log.Logger, db *db.DB) (*Analyzer, error) {
 	// Create embedding provider
 	config := NewLlamaCppConfig().WithLogger(logger)
 	embeddings, err := NewLlamaCppEmbeddingProvider(config)
@@ -114,7 +114,7 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 
 			// Parse transaction details
 			analysisStart := time.Now()
-			details, err := a.analyzeTransaction(gCtx, t, config.Model)
+			details, err := a.analyzeTransaction(gCtx, t, config.OpenRouterModel)
 			if err != nil {
 				// If context was canceled, return immediately
 				if errors.Is(err, context.Canceled) {
@@ -260,43 +260,42 @@ Return the information in JSON format with these fields:
 		t.Payee, t.Amount, t.Date)
 
 	var details *types.TransactionDetails
-	var resp openai.ChatCompletionResponse
 
-	// Retry the OpenAI API call with exponential backoff
+	// Retry the API call with exponential backoff
 	err := retry.Do(
 		func() error {
 			var err error
-			resp, err = a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-				Model: model,
-				Messages: []openai.ChatCompletionMessage{
-					{
-						Role:    openai.ChatMessageRoleSystem,
-						Content: "You are a financial transaction parser. Classify transactions and extract structured information. Follow the rules strictly, especially about removing payment processor prefixes.",
+			resp, err := a.client.CreateChatCompletion(
+				ctx,
+				openrouter.ChatCompletionRequest{
+					Model: model,
+					Messages: []openrouter.ChatCompletionMessage{
+						{
+							Role:    openrouter.ChatMessageRoleSystem,
+							Content: openrouter.Content{Text: "You are a financial transaction parser. Classify transactions and extract structured information. Follow the rules strictly, especially about removing payment processor prefixes."},
+						},
+						{
+							Role:    openrouter.ChatMessageRoleUser,
+							Content: openrouter.Content{Text: prompt},
+						},
 					},
-					{
-						Role:    openai.ChatMessageRoleUser,
-						Content: prompt,
+					ResponseFormat: &openrouter.ChatCompletionResponseFormat{
+						Type: openrouter.ChatCompletionResponseFormatTypeJSONObject,
 					},
 				},
-				ResponseFormat: &openai.ChatCompletionResponseFormat{
-					Type: openai.ChatCompletionResponseFormatTypeJSONObject,
-				},
-			})
+			)
 			if err != nil {
-				// Check if this is a retryable error
-				if openaiErr, ok := err.(*openai.APIError); ok {
-					// Retry on server errors, rate limits, and gateway errors
-					if openaiErr.HTTPStatusCode >= 500 ||
-						openaiErr.HTTPStatusCode == 429 ||
-						openaiErr.HTTPStatusCode == 502 ||
-						openaiErr.HTTPStatusCode == 503 ||
-						openaiErr.HTTPStatusCode == 504 {
-						a.logger.Warn("OpenAI API error, will retry",
-							"status_code", openaiErr.HTTPStatusCode,
-							"error", openaiErr.Message)
-						return err
-					}
-				}
+				// If error is API error with status code, we can check if it's retryable
+				// if resp.StatusCode >= 500 ||
+				// 	resp.StatusCode == 429 ||
+				// 	resp.StatusCode == 502 ||
+				// 	resp.StatusCode == 503 ||
+				// 	resp.StatusCode == 504 {
+				// 	a.logger.Warn("API error, will retry",
+				// 		"status_code", resp.StatusCode,
+				// 		"error", err.Error())
+				// 	return err
+				// }
 				// For other errors, don't retry
 				return retry.Unrecoverable(err)
 			}
@@ -308,11 +307,18 @@ Return the information in JSON format with these fields:
 
 			// Try to unmarshal the response to validate it's valid JSON
 			var testDetails types.TransactionDetails
-			if err := json.Unmarshal([]byte(resp.Choices[0].Message.Content), &testDetails); err != nil {
+			responseText := resp.Choices[0].Message.Content.Text
+			if err := json.Unmarshal([]byte(responseText), &testDetails); err != nil {
 				a.logger.Warn("Invalid JSON response, will retry",
 					"error", err,
-					"response", resp.Choices[0].Message.Content)
+					"response", responseText)
 				return fmt.Errorf("invalid JSON response: %w", err)
+			}
+
+			// Parse the details
+			details = &types.TransactionDetails{}
+			if err := json.Unmarshal([]byte(responseText), details); err != nil {
+				return retry.Unrecoverable(fmt.Errorf("error unmarshaling response: %w", err))
 			}
 
 			return nil
@@ -321,7 +327,7 @@ Return the information in JSON format with these fields:
 		retry.Attempts(3),
 		retry.DelayType(retry.BackOffDelay),
 		retry.OnRetry(func(n uint, err error) {
-			a.logger.Warn("Retrying OpenAI API call",
+			a.logger.Warn("Retrying API call",
 				"attempt", n+1,
 				"max_attempts", 3,
 				"error", err,
@@ -331,11 +337,6 @@ Return the information in JSON format with these fields:
 
 	if err != nil {
 		return nil, fmt.Errorf("error getting completion: %w", err)
-	}
-
-	details = &types.TransactionDetails{}
-	if err := json.Unmarshal([]byte(resp.Choices[0].Message.Content), details); err != nil {
-		return nil, fmt.Errorf("error unmarshaling response: %w", err)
 	}
 
 	a.logger.Info("Successfully parsed transaction details",
