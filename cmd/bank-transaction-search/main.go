@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/alecthomas/kong"
@@ -18,12 +19,11 @@ type CLI struct {
 	commands.CommonConfig
 	commands.EmbeddingConfig
 
-	Query               string  `help:"Search query - what you're looking for" required:""`
-	Days                int     `help:"Number of days to look back" default:"30"`
-	Limit               int     `help:"Maximum number of results to return" default:"10"`
-	Vector              bool    `help:"Use vector search instead of full-text search" default:"false"`
-	ShowBoth            bool    `help:"Show both vector and text search results for comparison" default:"false"`
-	SimilarityThreshold float32 `help:"Minimum similarity score for vector search results (0.0-1.0)" default:"0.5"`
+	Query     string  `help:"Search query - what you're looking for" required:""`
+	Days      int     `help:"Number of days to look back" default:"30"`
+	Limit     int     `help:"Maximum number of results to return" default:"100"`
+	Method    string  `help:"Search method to use" default:"hybrid" enum:"text,vector,hybrid"`
+	Threshold float32 `help:"Minimum similarity score for search results (0.0-1.0)" default:"0.4"`
 }
 
 func (c *CLI) Run() error {
@@ -35,25 +35,32 @@ func (c *CLI) Run() error {
 	}
 	defer database.Close()
 
-	// For text search only
-	if !c.Vector && !c.ShowBoth {
+	// Handle search based on method
+	switch c.Method {
+	case "text":
 		return c.performTextSearch(ctx, database, logger)
-	}
+	case "vector":
+		// Initialize vector search components (needed for both vector and hybrid search)
+		embeddingProvider, _, txAnalyzer, err := c.setupVectorComponents(ctx, logger, database)
+		if err != nil {
+			return err
+		}
+		defer commands.CloseEmbeddingProvider(embeddingProvider, logger)
 
-	// Initialize vector search components
-	embeddingProvider, _, txAnalyzer, err := c.setupVectorComponents(ctx, logger, database)
-	if err != nil {
-		return err
-	}
-	defer commands.CloseEmbeddingProvider(embeddingProvider, logger)
+		return c.performVectorSearch(ctx, txAnalyzer, logger)
+	case "hybrid":
+		// Initialize vector search components (needed for both vector and hybrid search)
+		embeddingProvider, _, txAnalyzer, err := c.setupVectorComponents(ctx, logger, database)
+		if err != nil {
+			return err
+		}
+		defer commands.CloseEmbeddingProvider(embeddingProvider, logger)
 
-	// For ShowBoth option (comparison)
-	if c.ShowBoth {
-		return c.performComparisonSearch(ctx, txAnalyzer, database, logger)
+		return c.performHybridSearch(ctx, txAnalyzer, logger)
+	default:
+		// This should never happen due to enum validation, but just in case
+		return fmt.Errorf("invalid search method: %s", c.Method)
 	}
-
-	// Standard vector search
-	return c.performVectorSearch(ctx, txAnalyzer, logger)
 }
 
 // setupCommonComponents initializes logger, timezone, and database
@@ -114,20 +121,21 @@ func (c *CLI) setupVectorComponents(ctx context.Context, logger *log.Logger, dat
 
 // performTextSearch performs a full-text search and displays results
 func (c *CLI) performTextSearch(ctx context.Context, database *db.DB, logger *log.Logger) error {
-	transactions, err := database.SearchTransactionsByText(ctx, c.Query, c.Days, c.Limit)
+	searchResults, err := database.SearchTransactionsByText(ctx, c.Query, c.Days, c.Limit)
 	if err != nil {
 		logger.Fatal("Failed to search transactions", "error", err)
 	}
 
 	// Print results
-	if len(transactions) == 0 {
+	if len(searchResults) == 0 {
 		fmt.Println("No transactions found")
 		return nil
 	}
 
-	fmt.Printf("Found %d transactions using text search:\n\n", len(transactions))
-	for _, t := range transactions {
-		fmt.Printf("%s: %s - %s\n", t.Date, t.Amount, t.Payee)
+	fmt.Printf("Found %d transactions:\n\n", len(searchResults))
+	for _, result := range searchResults {
+		t := result.TransactionWithDetails
+		fmt.Printf("%s: %s - %s (text score: %.2f)\n", t.Date, t.Amount, t.Payee, result.Scores.TextScore)
 		printTransactionDetails(t)
 	}
 
@@ -136,8 +144,7 @@ func (c *CLI) performTextSearch(ctx context.Context, database *db.DB, logger *lo
 
 // performVectorSearch performs a vector search and displays results
 func (c *CLI) performVectorSearch(ctx context.Context, txAnalyzer *analyzer.Analyzer, logger *log.Logger) error {
-	// Vector search no longer uses days parameter
-	searchResults, err := txAnalyzer.VectorSearch(ctx, c.Query, c.Limit, c.SimilarityThreshold)
+	searchResults, err := txAnalyzer.VectorSearch(ctx, c.Query, c.Limit, c.Threshold, c.Days)
 	if err != nil {
 		logger.Fatal("Failed to perform vector search", "error", err)
 	}
@@ -148,7 +155,7 @@ func (c *CLI) performVectorSearch(ctx context.Context, txAnalyzer *analyzer.Anal
 		return nil
 	}
 
-	fmt.Printf("Found %d transactions using vector search\n\n", len(searchResults))
+	fmt.Printf("Found %d transactions:\n\n", len(searchResults))
 
 	for _, result := range searchResults {
 		t := result.TransactionWithDetails
@@ -159,45 +166,37 @@ func (c *CLI) performVectorSearch(ctx context.Context, txAnalyzer *analyzer.Anal
 	return nil
 }
 
-// performComparisonSearch performs both vector and text searches and displays results side-by-side
-func (c *CLI) performComparisonSearch(ctx context.Context, txAnalyzer *analyzer.Analyzer, database *db.DB, logger *log.Logger) error {
-	// Perform vector search (no days parameter)
-	vectorResults, err := txAnalyzer.VectorSearch(ctx, c.Query, c.Limit, c.SimilarityThreshold)
+// performHybridSearch performs a hybrid search and displays results
+func (c *CLI) performHybridSearch(ctx context.Context, txAnalyzer *analyzer.Analyzer, logger *log.Logger) error {
+	searchResults, err := txAnalyzer.HybridSearch(ctx, c.Query, c.Days, c.Limit, c.Threshold)
 	if err != nil {
-		logger.Fatal("Failed to perform vector search", "error", err)
+		logger.Fatal("Failed to perform hybrid search", "error", err)
 	}
 
-	// Perform text search (still using Days parameter)
-	textResults, err := database.SearchTransactionsByText(ctx, c.Query, c.Days, c.Limit)
-	if err != nil {
-		logger.Fatal("Failed to search transactions", "error", err)
+	// Print results
+	if len(searchResults) == 0 {
+		fmt.Println("No transactions found")
+		return nil
 	}
 
-	// Print comparison results
-	fmt.Printf("==== SEARCH COMPARISON: '%s' ====\n\n", c.Query)
+	fmt.Printf("Found %d transactions:\n\n", len(searchResults))
 
-	// Print vector search results
-	fmt.Printf("=== VECTOR SEARCH RESULTS (%d) ===\n\n", len(vectorResults))
-	var displayedCount int
-	for _, result := range vectorResults {
-		// Apply similarity threshold filter
-		if float32(result.Scores.VectorScore) >= c.SimilarityThreshold {
-			t := result.TransactionWithDetails
-			fmt.Printf("%s: %s - %s (similarity: %.2f)\n", t.Date, t.Amount, t.Payee, result.Scores.VectorScore)
-			printTransactionDetails(t)
-			displayedCount++
+	for _, result := range searchResults {
+		t := result.TransactionWithDetails
+		fmt.Printf("%s: %s - %s (score: %.4f)\n", t.Date, t.Amount, t.Payee, result.Scores.RRFScore)
+
+		// Show individual scores if they exist
+		var scores []string
+		if result.Scores.TextScore != 0 {
+			scores = append(scores, fmt.Sprintf("text: %.2f", result.Scores.TextScore))
 		}
-	}
+		if result.Scores.VectorScore != 0 {
+			scores = append(scores, fmt.Sprintf("vector: %.2f", result.Scores.VectorScore))
+		}
+		if len(scores) > 0 {
+			fmt.Printf("  Scores: %s\n", strings.Join(scores, ", "))
+		}
 
-	if displayedCount < len(vectorResults) {
-		fmt.Printf("\n%d results were filtered out due to similarity threshold (%.2f)\n\n",
-			len(vectorResults)-displayedCount, c.SimilarityThreshold)
-	}
-
-	// Print text search results
-	fmt.Printf("=== TEXT SEARCH RESULTS (%d) ===\n\n", len(textResults))
-	for _, t := range textResults {
-		fmt.Printf("%s: %s - %s\n", t.Date, t.Amount, t.Payee)
 		printTransactionDetails(t)
 	}
 

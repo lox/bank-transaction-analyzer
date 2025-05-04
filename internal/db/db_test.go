@@ -136,8 +136,13 @@ func TestSearchTransactions(t *testing.T) {
 	if len(textResults) != 1 {
 		t.Fatalf("Expected 1 result, got %d", len(textResults))
 	}
-	if textResults[0].Details.Merchant != "Coffee Shop" {
-		t.Errorf("Expected merchant 'Coffee Shop', got '%s'", textResults[0].Details.Merchant)
+	if textResults[0].TransactionWithDetails.Details.Merchant != "Coffee Shop" {
+		t.Errorf("Expected merchant 'Coffee Shop', got '%s'", textResults[0].TransactionWithDetails.Details.Merchant)
+	}
+
+	// Check that we have a valid text score (BM25 scores are negative in SQLite)
+	if textResults[0].Scores.TextScore >= 0 {
+		t.Errorf("Expected negative text score (SQLite BM25), got %f", textResults[0].Scores.TextScore)
 	}
 }
 

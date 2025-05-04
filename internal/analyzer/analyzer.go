@@ -14,7 +14,6 @@ import (
 	"github.com/lox/bank-transaction-analyzer/internal/db"
 	"github.com/lox/bank-transaction-analyzer/internal/types"
 	openrouter "github.com/revrost/go-openrouter"
-	"github.com/revrost/go-openrouter/jsonschema"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -65,7 +64,7 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 	if err != nil {
 		return nil, fmt.Errorf("error filtering existing transactions: %w", err)
 	}
-	a.logger.Info("Filtered existing transactions",
+	a.logger.Debug("Filtered existing transactions",
 		"duration", time.Since(filterStart),
 		"total", len(filteredTransactions),
 		"skipped", len(transactions)-len(filteredTransactions))
@@ -142,9 +141,6 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 					"duration", time.Since(storeStart))
 				return fmt.Errorf("error storing transaction: %w", err)
 			}
-			a.logger.Debug("Transaction storage completed",
-				"payee", t.Payee,
-				"duration", time.Since(storeStart))
 
 			// Add to results
 			analyzedTransactions = append(analyzedTransactions, types.TransactionWithDetails{
@@ -185,213 +181,145 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 // analyzeTransaction uses an LLM to extract structured information from a transaction
 func (a *Analyzer) analyzeTransaction(ctx context.Context, t types.Transaction, model string) (*types.TransactionDetails, error) {
 	startTime := time.Now()
-	a.logger.Info("Analyzing transaction",
+	a.logger.Debug("Analyzing transaction",
 		"payee", t.Payee,
 		"amount", t.Amount,
 		"date", t.Date,
 		"model", model)
 
-	prompt := fmt.Sprintf(`Extract structured information from this transaction description.
-Classify the transaction type and extract relevant details.
-
-IMPORTANT RULES:
-1. Remove payment processor prefixes and suffixes:
-   - Remove "SQ *" (Square)
-   - Remove "Visa Purchase", "EFTPOS Purchase"
-   - Remove "Receipt" and receipt numbers
-   - Remove "Date", "Time" and timestamps
-   - Remove "Card" and card numbers
-2. Extract location even if it's at the end of the merchant name
-3. Use consistent categories from this list:
-   - Food & Dining (restaurants, cafes, food delivery)
-   - Shopping (retail stores, online shopping)
-   - Transportation (Uber, taxis, public transport)
-   - Entertainment (movies, events, festivals)
-   - Services (utilities, subscriptions, professional services)
-   - Personal Care (health, beauty, fitness)
-   - Travel (flights, accommodation, travel services)
-   - Education (courses, books, educational services)
-   - Home (furniture, appliances, home improvement)
-   - Groceries (supermarkets, food stores)
-   - Bank Fees (fees, charges, interest)
-   - Transfers (personal transfers, payments)
-   - Other (anything that doesn't fit above categories)
-4. For foreign amounts:
-   - Carefully extract all foreign amount and currency information
-   - If you see "Foreign Currency Amount: USD 11.99", extract amount=11.99 and currency=USD
-   - Amount MUST be a valid number (integer or decimal), not a string or object
-   - The amount should be just the number value without currency symbols or formatting
-   - Currency must be the 3-letter currency code (USD, EUR, GBP, etc.)
-   - Example: For "Foreign amount USD 29.99", use {"amount": 29.99, "currency": "USD"}
-   - NEVER return an empty object {} for foreign_amount
-5. Special handling for food delivery services:
-   - For Uber Eats, use "Uber Eats" as merchant name
-   - For DoorDash, use "DoorDash" as merchant name
-   - For Menulog, use "Menulog" as merchant name
-   - Category should be "Food & Dining" for all food delivery services
-6. Clean merchant names:
-   - Remove any domain names (e.g., .com, .co)
-   - Remove any help/support text
-   - Use the main brand name only
-   - Use proper case formatting (e.g., "Richie's Cafe" not "RICHIES CAFE")
-   - For chains, use their official capitalization (e.g., "McDonald's" not "MCDONALDS")
-   - For local businesses, use title case with appropriate apostrophes
-7. Description field rules:
-   - NEVER include the amount in the description
-   - Provide a brief description of what was purchased
-   - For restaurants/cafes, describe the type of food or service
-   - For retail, describe the type of items purchased
-   - For services, describe the service provided
-   - Keep descriptions concise but informative
-8. Card number extraction:
-   - If a card number is present in the format "Card XXXX...XXXX", extract it
-   - Store the full card number in the card_number field
-   - Do not mask or truncate the card number
-9. Transfer details processing:
-   - For transfer transactions, carefully extract account numbers, removing any non-essential characters
-   - The to_account field should only contain the account number, not dates, amounts, or transaction details
-   - For reference fields, keep only the actual reference text, not dates or amounts
-   - Never include the full transaction details in the transfer_details fields
-   - Ignore any narrative text that describes the transaction
-   - Example: For "Transfer to BSB 123-456 Account 12345678 Reference: RENT JUN", use {"to_account": "12345678", "reference": "RENT JUN"}
-10. Search body generation:
-   - Generate a search_body field that contains all relevant keywords from the transaction
-   - Include the merchant name, location, description, and any other relevant details
-   - Use proper case formatting for the search_body
-
-EXAMPLES:
-
-Example 1 - Purchase:
-Transaction: EFTPOS PURCHASE AMAZON.COM.AU SYDNEY AU ON 12 MAR Card 1234...5678
-Amount: -49.95
-Date: 2023-03-12
-
-Correct response:
-{
-  "type": "purchase",
-  "merchant": "Amazon",
-  "location": "Sydney AU",
-  "category": "Shopping",
-  "description": "Online retail purchase",
-  "card_number": "1234...5678",
-  "search_body": "Amazon Sydney AU Online retail purchase"
-}
-
-Example 2 - Transfer:
-Transaction: Transfer to Nicole Smith BSB 062-692 Account 87654321 Reference: BIRTHDAY GIFT
-Amount: -100.00
-Date: 2023-04-15
-
-Correct response:
-{
-  "type": "transfer",
-  "merchant": "Nicole Smith",
-  "category": "Transfers",
-  "description": "Personal transfer",
-  "search_body": "Nicole Smith Personal transfer Birthday gift",
-  "transfer_details": {
-    "to_account": "87654321",
-    "reference": "BIRTHDAY GIFT"
-  }
-}
-
-Example 3 - Foreign Purchase:
-Transaction: UBER TRIP 1234ABCD SAN FRANCISCO USA Foreign Currency Amount USD 11.99
-Amount: -18.52
-Date: 2023-05-22
-
-Correct response:
-{
-  "type": "purchase",
-  "merchant": "Uber",
-  "location": "San Francisco USA",
-  "category": "Transportation",
-  "description": "Ride service",
-  "search_body": "Uber San Francisco USA Ride service",
-  "foreign_amount": {
-    "amount": 11.99,
-    "currency": "USD"
-  }
-}
-
-Example 4 - Food Delivery:
-Transaction: DOORDASH *MARIOS PIZZA MELBOURNE
-Amount: -32.50
-Date: 2023-06-10
-
-Correct response:
-{
-  "type": "purchase",
-  "merchant": "DoorDash",
-  "location": "Melbourne",
-  "category": "Food & Dining",
-  "description": "Food delivery from Mario's Pizza",
-  "search_body": "DoorDash Melbourne Food delivery Mario's Pizza"
-}
+	prompt := fmt.Sprintf(`Extract and classify transaction details from the following bank transaction.
 
 Transaction: %s
 Amount: %s
-Date: %s`,
+Date: %s
+
+Your task is to analyze this transaction and call the classify_transaction function with structured data.
+
+When calling the function, follow these guidelines:
+
+TRANSACTION TYPE GUIDELINES:
+- "purchase" - For retail transactions, subscriptions, and general spending
+- "transfer" - For bank transfers, payments to individuals
+- "fee" - For bank fees, account fees, interest charges
+- "deposit" - For money received or added to account
+- "withdrawal" - For ATM withdrawals or manual withdrawals
+- "refund" - For refunded purchases or returns
+- "interest" - For interest earned on accounts
+
+CATEGORY GUIDELINES:
+Use one of these specific categories:
+- Food & Dining (restaurants, cafes, food delivery)
+- Shopping (retail stores, online shopping)
+- Transportation (Uber, taxis, public transport)
+- Entertainment (movies, events, festivals)
+- Services (utilities, subscriptions, professional services)
+- Personal Care (health, beauty, fitness)
+- Travel (flights, accommodation, travel services)
+- Education (courses, books, educational services)
+- Home (furniture, appliances, home improvement)
+- Groceries (supermarkets, food stores)
+- Bank Fees (fees, charges, interest)
+- Transfers (personal transfers, payments)
+- Other (anything that doesn't fit above categories)
+
+DATA CLEANING GUIDELINES:
+1. Remove payment processor details:
+   - Remove "SQ *" (Square), "Visa Purchase", "EFTPOS Purchase"
+   - Remove "Receipt" and receipt numbers
+   - Remove "Date", "Time" and timestamps
+   - Remove "Card" and card numbers unless needed in card_number field
+2. For foreign amounts:
+   - Extract amount as a number (e.g., 11.99, not "$11.99")
+   - Extract 3-letter currency code (e.g., USD, EUR)
+3. Format merchant names properly:
+   - Remove domains (.com, .net)
+   - Use proper capitalization (e.g., "McDonald's", not "MCDONALDS")
+   - For local businesses, use Title Case with appropriate apostrophes
+
+The classify_transaction function requires these fields: type, merchant, category, description, and search_body.`,
 		t.Payee, t.Amount, t.Date)
 
 	var details *types.TransactionDetails
 
-	// Create a custom schema that properly handles the decimal.Decimal type
-	customSchema := jsonschema.Definition{
-		Type: jsonschema.Object,
-		Properties: map[string]jsonschema.Definition{
-			"type": {
-				Type: jsonschema.String,
-				Enum: []string{"purchase", "transfer", "fee", "deposit", "withdrawal", "refund", "interest"},
-			},
-			"merchant": {
-				Type: jsonschema.String,
-			},
-			"location": {
-				Type: jsonschema.String,
-			},
-			"category": {
-				Type: jsonschema.String,
-			},
-			"description": {
-				Type: jsonschema.String,
-			},
-			"card_number": {
-				Type: jsonschema.String,
-			},
-			"search_body": {
-				Type: jsonschema.String,
-			},
-			"foreign_amount": {
-				Type: jsonschema.Object, // Can be null through omitempty
-				Properties: map[string]jsonschema.Definition{
-					"amount": {
-						Type:        jsonschema.Number,
-						Description: "The amount in the foreign currency as a numerical value",
-					},
-					"currency": {
-						Type:        jsonschema.String,
-						Description: "The 3-letter currency code (e.g., USD, EUR, GBP)",
-					},
-				},
-				Required: []string{"amount", "currency"},
-			},
-			"transfer_details": {
-				Type: jsonschema.Object, // Can be null through omitempty
-				Properties: map[string]jsonschema.Definition{
-					"to_account": {
-						Type: jsonschema.String,
-					},
-					"from_account": {
-						Type: jsonschema.String,
-					},
-					"reference": {
-						Type: jsonschema.String,
-					},
-				},
-			},
+	// Define the parse transaction tool
+	params := map[string]any{
+		"type": map[string]any{
+			"type":        "string",
+			"enum":        []string{"purchase", "transfer", "fee", "deposit", "withdrawal", "refund", "interest"},
+			"description": "The type of transaction",
 		},
-		Required: []string{"type", "merchant", "category", "description", "search_body"},
+		"merchant": map[string]any{
+			"type":        "string",
+			"description": "The merchant or counterparty name",
+		},
+		"location": map[string]any{
+			"type":        "string",
+			"description": "The location of the transaction, if available",
+		},
+		"category": map[string]any{
+			"type":        "string",
+			"description": "The spending category of the transaction",
+		},
+		"description": map[string]any{
+			"type":        "string",
+			"description": "A brief description of what was purchased or the purpose of the transaction",
+		},
+		"card_number": map[string]any{
+			"type":        "string",
+			"description": "Card number used for the transaction, if available",
+		},
+		"search_body": map[string]any{
+			"type":        "string",
+			"description": "Text to use for search indexing, containing relevant keywords",
+		},
+		"foreign_amount": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"amount": map[string]any{
+					"type":        "number",
+					"description": "The amount in foreign currency",
+				},
+				"currency": map[string]any{
+					"type":        "string",
+					"description": "The 3-letter currency code",
+				},
+			},
+			"required":    []string{"amount", "currency"},
+			"description": "Details of the transaction amount in a foreign currency, if applicable",
+		},
+		"transfer_details": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"to_account": map[string]any{
+					"type":        "string",
+					"description": "The recipient account number",
+				},
+				"from_account": map[string]any{
+					"type":        "string",
+					"description": "The sender account number",
+				},
+				"reference": map[string]any{
+					"type":        "string",
+					"description": "The payment reference or description",
+				},
+			},
+			"description": "Additional details for transfer transactions",
+		},
+	}
+
+	// Add required fields to params
+	params["required"] = []string{"type", "merchant", "category", "description", "search_body"}
+
+	f := openrouter.FunctionDefinition{
+		Name:        "classify_transaction",
+		Description: "Classify and extract details from bank transaction data",
+		Parameters:  params,
+		Strict:      true,
+	}
+
+	parseTransactionTool := openrouter.Tool{
+		Type:     openrouter.ToolTypeFunction,
+		Function: &f,
 	}
 
 	// Retry the API call with exponential backoff
@@ -404,23 +332,16 @@ Date: %s`,
 					Messages: []openrouter.ChatCompletionMessage{
 						{
 							Role:    openrouter.ChatMessageRoleSystem,
-							Content: openrouter.Content{Text: "You are a financial transaction parser. Extract structured data from transaction descriptions into clean JSON as specified by the schema provided. Follow these critical rules: 1) For foreign_amount, always return a number for amount, never a string or empty object. 2) For transfer_details, extract only essential account numbers and references, not dates or narrative text. 3) Make merchant names clean and consistent. 4) Generate an appropriate search_body field containing relevant keywords from the transaction. 5) Never hallucinate or add information not present in the transaction."},
+							Content: openrouter.Content{Text: "You are a financial transaction classifier. You must call the classify_transaction function to extract and structure transaction data. DO NOT explain your reasoning or add comments. ONLY call the function with properly formatted JSON arguments. Follow the exact structure and guidelines provided in the user's prompt."},
 						},
 						{
 							Role:    openrouter.ChatMessageRoleUser,
 							Content: openrouter.Content{Text: prompt},
 						},
 					},
-					MaxCompletionTokens: 500,
+					MaxCompletionTokens: 1000,
 					Temperature:         0.1,
-					ResponseFormat: &openrouter.ChatCompletionResponseFormat{
-						Type: openrouter.ChatCompletionResponseFormatTypeJSONSchema,
-						JSONSchema: &openrouter.ChatCompletionResponseFormatJSONSchema{
-							Name:   "transaction_details",
-							Schema: &customSchema,
-							Strict: true,
-						},
-					},
+					Tools:               []openrouter.Tool{parseTransactionTool},
 				},
 			)
 			if err != nil {
@@ -432,16 +353,28 @@ Date: %s`,
 				return retry.Unrecoverable(fmt.Errorf("no choices in response"))
 			}
 
-			// Parse the details
-			details = &types.TransactionDetails{}
-			responseText := resp.Choices[0].Message.Content.Text
-			if err := json.Unmarshal([]byte(responseText), details); err != nil {
-				a.logger.Warn("Invalid JSON response, will retry",
-					"error", err,
-					"response", responseText)
-				return fmt.Errorf("invalid JSON response: %w", err)
+			// Check if the response contains tool calls
+			message := resp.Choices[0].Message
+			if len(message.ToolCalls) == 0 {
+				return fmt.Errorf("no tool calls in response")
 			}
 
+			// Get the first tool call
+			toolCall := message.ToolCalls[0]
+			if toolCall.Function.Name != "classify_transaction" {
+				return fmt.Errorf("unexpected tool call: %s", toolCall.Function.Name)
+			}
+
+			// Parse the arguments
+			var parsedDetails types.TransactionDetails
+			if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &parsedDetails); err != nil {
+				a.logger.Warn("Invalid JSON in tool call arguments",
+					"error", err,
+					"arguments", toolCall.Function.Arguments)
+				return fmt.Errorf("invalid JSON in tool call arguments: %w", err)
+			}
+
+			details = &parsedDetails
 			return nil
 		},
 		retry.Context(ctx),
@@ -460,7 +393,7 @@ Date: %s`,
 		return nil, fmt.Errorf("error getting completion: %w", err)
 	}
 
-	a.logger.Info("Successfully parsed transaction details",
+	a.logger.Debug("Successfully parsed transaction details",
 		"payee", t.Payee,
 		"type", details.Type,
 		"merchant", details.Merchant,
@@ -492,7 +425,7 @@ func (a *Analyzer) storeTransaction(ctx context.Context, t types.Transaction, de
 		// Continue anyway, as storing the transaction in the DB was successful
 	}
 
-	a.logger.Info("Transaction storage completed",
+	a.logger.Debug("Transaction storage completed",
 		"payee", t.Payee,
 		"total_duration", time.Since(startTime))
 
@@ -607,17 +540,46 @@ func (a *Analyzer) UpdateEmbeddings(ctx context.Context, transactions []types.Tr
 	return nil
 }
 
+// TextSearch finds transactions matching the given query using full-text search
+func (a *Analyzer) TextSearch(
+	ctx context.Context,
+	query string,
+	days int,
+	limit int,
+) ([]types.TransactionSearchResult, error) {
+	a.logger.Info("Performing text search",
+		"query", query,
+		"days", days,
+		"limit", limit)
+	startTime := time.Now()
+
+	// Perform text search using the database
+	searchResults, err := a.db.SearchTransactionsByText(ctx, query, days, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search transactions by text: %w", err)
+	}
+
+	a.logger.Info("Text search completed",
+		"query", query,
+		"results", len(searchResults),
+		"duration", time.Since(startTime))
+
+	return searchResults, nil
+}
+
 // VectorSearch finds transactions similar to the given query using vector embeddings
 func (a *Analyzer) VectorSearch(
 	ctx context.Context,
 	query string,
 	limit int,
 	threshold float32,
+	days int,
 ) ([]types.TransactionSearchResult, error) {
 	a.logger.Info("Performing vector search",
 		"query", query,
 		"limit", limit,
-		"threshold", threshold)
+		"threshold", threshold,
+		"days", days)
 	startTime := time.Now()
 
 	// Generate embedding for the query
@@ -627,18 +589,18 @@ func (a *Analyzer) VectorSearch(
 	}
 
 	// Query similar transaction IDs from vector storage with threshold applied
-	similarResults, err := a.vectors.QuerySimilar(ctx, embedding, limit, threshold)
+	vectorResults, err := a.vectors.Query(ctx, embedding, threshold)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query similar transactions: %w", err)
 	}
 
 	a.logger.Debug("Vector search raw results",
 		"query", query,
-		"raw_results", len(similarResults),
+		"raw_results", len(vectorResults),
 		"threshold", threshold)
 
 	// If no results from vector search, return empty slice
-	if len(similarResults) == 0 {
+	if len(vectorResults) == 0 {
 		a.logger.Info("No similar transactions found", "duration", time.Since(startTime))
 		return []types.TransactionSearchResult{}, nil
 	}
@@ -646,8 +608,12 @@ func (a *Analyzer) VectorSearch(
 	// Fetch each transaction by ID and build result set
 	var results []types.TransactionSearchResult
 	var fetchErrors int
+	var filteredOutByDate int
 
-	for _, result := range similarResults {
+	// Calculate the cutoff date
+	cutoffDate := time.Now().AddDate(0, 0, -days)
+
+	for _, result := range vectorResults {
 		// Fetch transaction by ID
 		tx, err := a.db.GetTransactionByID(ctx, result.ID)
 		if err != nil {
@@ -655,6 +621,22 @@ func (a *Analyzer) VectorSearch(
 				"id", result.ID,
 				"error", err)
 			fetchErrors++
+			continue
+		}
+
+		// Parse transaction date
+		txDate, err := time.Parse("02/01/2006", tx.Date)
+		if err != nil {
+			a.logger.Warn("Failed to parse transaction date",
+				"date", tx.Date,
+				"error", err)
+			fetchErrors++
+			continue
+		}
+
+		// Filter by date if days parameter is provided
+		if days > 0 && txDate.Before(cutoffDate) {
+			filteredOutByDate++
 			continue
 		}
 
@@ -666,30 +648,153 @@ func (a *Analyzer) VectorSearch(
 			},
 		}
 		results = append(results, searchResult)
-	}
 
-	// Sort by vector score (highest first)
-	sortSearchResultsByVectorScore(results)
-
-	// Limit results if needed (shouldn't be necessary as we already limited at the database level,
-	// but keeping as a safety measure)
-	if len(results) > limit {
-		results = results[:limit]
+		// Stop once we have enough results
+		if len(results) >= limit {
+			break
+		}
 	}
 
 	a.logger.Info("Vector search completed",
 		"query", query,
 		"results", len(results),
 		"fetch_errors", fetchErrors,
+		"filtered_by_date", filteredOutByDate,
 		"threshold", threshold,
 		"duration", time.Since(startTime))
 
 	return results, nil
 }
 
-// sortSearchResultsByVectorScore sorts search results by their vector similarity score (highest first)
-func sortSearchResultsByVectorScore(results []types.TransactionSearchResult) {
+// HybridSearch performs both text and vector searches and combines results using Reciprocal Rank Fusion (RRF)
+func (a *Analyzer) HybridSearch(
+	ctx context.Context,
+	query string,
+	days int,
+	limit int,
+	vectorThreshold float32,
+) ([]types.TransactionSearchResult, error) {
+	a.logger.Info("Performing hybrid search with Reciprocal Rank Fusion",
+		"query", query,
+		"days", days,
+		"limit", limit,
+		"vector_threshold", vectorThreshold)
+	startTime := time.Now()
+
+	// Perform text search
+	textResults, err := a.db.SearchTransactionsByText(ctx, query, days, limit*2) // Get more results for better fusion
+	if err != nil {
+		return nil, fmt.Errorf("text search failed: %w", err)
+	}
+
+	// Perform vector search
+	vectorResults, err := a.VectorSearch(ctx, query, limit, vectorThreshold, days)
+	if err != nil {
+		return nil, fmt.Errorf("vector search failed: %w", err)
+	}
+
+	a.logger.Debug("Hybrid search raw results",
+		"text_results", len(textResults),
+		"vector_results", len(vectorResults))
+
+	// No results from either search
+	if len(textResults) == 0 && len(vectorResults) == 0 {
+		a.logger.Info("No results found in hybrid search", "duration", time.Since(startTime))
+		return []types.TransactionSearchResult{}, nil
+	}
+
+	// Map of transaction IDs to their search results and rankings
+	type resultInfo struct {
+		result     types.TransactionSearchResult
+		textRank   int // 1-based position in text results (0 if not found)
+		vectorRank int // 1-based position in vector results (0 if not found)
+	}
+
+	// Constant k for RRF formula
+	const k = 60 // Standard value often used in RRF
+
+	// Build combined results using transaction ID as the key
+	combinedResults := make(map[string]resultInfo)
+
+	// Process text search results
+	for i, result := range textResults {
+		// Generate transaction ID
+		txID := db.GenerateTransactionID(result.Transaction)
+
+		// Store or update the result in the combined map
+		if info, exists := combinedResults[txID]; exists {
+			info.textRank = i + 1 // 1-based ranking
+			combinedResults[txID] = info
+		} else {
+			combinedResults[txID] = resultInfo{
+				result:     result,
+				textRank:   i + 1, // 1-based ranking
+				vectorRank: 0,     // Not found in vector results yet
+			}
+		}
+	}
+
+	// Process vector search results
+	for i, result := range vectorResults {
+		// Generate transaction ID
+		txID := db.GenerateTransactionID(result.Transaction)
+
+		// Store or update the result in the combined map
+		if info, exists := combinedResults[txID]; exists {
+			info.vectorRank = i + 1 // 1-based ranking
+			info.result.Scores.VectorScore = result.Scores.VectorScore
+			combinedResults[txID] = info
+		} else {
+			combinedResults[txID] = resultInfo{
+				result:     result,
+				textRank:   0,     // Not found in text results
+				vectorRank: i + 1, // 1-based ranking
+			}
+		}
+	}
+
+	// Calculate RRF scores and prepare final results
+	var finalResults []types.TransactionSearchResult
+	for _, info := range combinedResults {
+		// Calculate RRF score using the formula: 1/(k + r) where r is the rank
+		var rrfScore float64
+
+		// Add text contribution if it exists
+		if info.textRank > 0 {
+			rrfScore += 1.0 / float64(k+info.textRank)
+		}
+
+		// Add vector contribution if it exists
+		if info.vectorRank > 0 {
+			rrfScore += 1.0 / float64(k+info.vectorRank)
+		}
+
+		// Create a copy of the result with RRF score
+		result := info.result
+		result.Scores.RRFScore = rrfScore
+
+		finalResults = append(finalResults, result)
+	}
+
+	// Sort results by RRF score (highest first)
+	sortSearchResultsByRRFScore(finalResults)
+
+	// Limit results if needed
+	if len(finalResults) > limit {
+		finalResults = finalResults[:limit]
+	}
+
+	a.logger.Info("Hybrid search completed",
+		"query", query,
+		"results", len(finalResults),
+		"duration", time.Since(startTime))
+
+	return finalResults, nil
+}
+
+// sortSearchResultsByRRFScore sorts search results by their RRF score (highest first)
+func sortSearchResultsByRRFScore(results []types.TransactionSearchResult) {
 	sort.Slice(results, func(i, j int) bool {
-		return results[i].Scores.VectorScore > results[j].Scores.VectorScore
+		return results[i].Scores.RRFScore > results[j].Scores.RRFScore
 	})
 }

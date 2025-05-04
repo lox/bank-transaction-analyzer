@@ -6,18 +6,21 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/charmbracelet/log"
 	"github.com/philippgille/chromem-go"
 )
 
-// SimilarityResult represents a single result from a similarity search
-type SimilarityResult struct {
+// VectorResult represents a single result from a vector search
+type VectorResult struct {
 	// ID is the transaction ID
 	ID string
 	// Similarity is the cosine similarity score (0.0-1.0)
 	Similarity float32
+	// Content is the content of the document
+	Content string
 }
 
 // VectorStorage is an interface for storing and retrieving vector embeddings
@@ -29,10 +32,10 @@ type VectorStorage interface {
 	// If content is provided, it will also check if the stored content hash matches
 	HasEmbedding(ctx context.Context, id string, content string) (bool, error)
 
-	// QuerySimilar finds transaction IDs similar to the given embedding
+	// Query finds transaction IDs similar to the given embedding
 	// threshold sets the minimum similarity score (0.0-1.0) for results
 	// if threshold <= 0, no threshold is applied
-	QuerySimilar(ctx context.Context, embedding []float32, limit int, threshold float32) ([]SimilarityResult, error)
+	Query(ctx context.Context, embedding []float32, threshold float32) ([]VectorResult, error)
 
 	// Close closes the storage
 	Close() error
@@ -178,64 +181,46 @@ func (s *ChromemStorage) HasEmbedding(ctx context.Context, id string, content st
 	storedModelName := metadata["model_name"]
 
 	// Compare the hashes
-	matches := storedHash == newContentHash
-
-	// Add model info to log if available
-	logFields := []interface{}{
-		"id", id,
-		"matches", matches,
-		"stored_hash", storedHash,
-		"new_hash", newContentHash,
-		"duration", time.Since(startTime),
-	}
-
-	if storedModelName != "" {
-		logFields = append(logFields, "model_name", storedModelName)
-	}
-
-	s.logger.Debug("Checked document content hash", logFields...)
+	matches := storedHash == newContentHash && storedModelName == s.modelName
 
 	return matches, nil
 }
 
 // QuerySimilar finds transaction IDs similar to the given embedding
-func (s *ChromemStorage) QuerySimilar(
-	ctx context.Context,
-	embedding []float32,
-	limit int,
-	threshold float32,
-) ([]SimilarityResult, error) {
+func (s *ChromemStorage) Query(ctx context.Context, embedding []float32, threshold float32) ([]VectorResult, error) {
 	startTime := time.Now()
 
 	// Query for similar documents
-	results, err := s.collection.QueryEmbedding(ctx, embedding, limit, nil, nil)
+	results, err := s.collection.QueryEmbedding(ctx, embedding, s.collection.Count(), nil, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query similar documents: %w", err)
+		return nil, fmt.Errorf("failed to query embeddings: %w", err)
 	}
 
 	// Extract IDs and similarity scores, filtering by threshold if applicable
-	var similarityResults []SimilarityResult
+	var vectorResults []VectorResult
 
 	for _, result := range results {
-		// Apply threshold filtering if requested
-		if threshold > 0 && result.Similarity < threshold {
+		if result.Similarity < threshold {
 			continue
 		}
-
-		similarityResults = append(similarityResults, SimilarityResult{
+		vectorResults = append(vectorResults, VectorResult{
 			ID:         result.ID,
 			Similarity: result.Similarity,
+			Content:    result.Content,
 		})
 	}
 
-	s.logger.Debug("Query similar completed",
-		"raw_results", len(results),
-		"filtered_results", len(similarityResults),
-		"threshold", threshold,
+	// Sort results by similarity (highest first)
+	sort.Slice(vectorResults, func(i, j int) bool {
+		return vectorResults[i].Similarity > vectorResults[j].Similarity
+	})
+
+	s.logger.Debug("Vector query completed",
+		"results", len(vectorResults),
 		"model_name", s.modelName,
 		"duration", time.Since(startTime))
 
-	return similarityResults, nil
+	return vectorResults, nil
 }
 
 // Close closes the database

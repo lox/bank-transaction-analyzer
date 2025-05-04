@@ -4,46 +4,27 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strconv"
-	"time"
 
 	"github.com/charmbracelet/log"
+	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
 	"github.com/lox/bank-transaction-analyzer/internal/db"
 	"github.com/lox/bank-transaction-analyzer/internal/types"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
-const (
-	dataDir  = "./data"
-	timezone = "Australia/Sydney"
-)
-
 type Server struct {
-	logger *log.Logger
-	db     *db.DB
+	db       *db.DB
+	analyzer *analyzer.Analyzer
+	logger   *log.Logger
 }
 
-func New() *Server {
-	// Create a null logger that discards all output
-	logger := log.New(os.Stderr)
-
-	// Load timezone
-	loc, err := time.LoadLocation(timezone)
-	if err != nil {
-		logger.Fatal("Failed to load timezone", "error", err)
-	}
-
-	// Initialize database
-	database, err := db.New(dataDir, logger, loc)
-	if err != nil {
-		logger.Fatal("Failed to initialize database", "error", err)
-	}
-
+func New(db *db.DB, analyzer *analyzer.Analyzer, logger *log.Logger) *Server {
 	return &Server{
-		logger: logger,
-		db:     database,
+		db:       db,
+		analyzer: analyzer,
+		logger:   logger,
 	}
 }
 
@@ -142,16 +123,16 @@ func (s *Server) searchTransactionsHandler(ctx context.Context, request mcp.Call
 		}
 	}
 
-	s.logger.Debug("Searching transactions", "query", query, "days", days, "limit", limit)
-	transactions, err := s.db.SearchTransactionsByText(ctx, query, days, limit)
+	transactions, err := s.analyzer.HybridSearch(ctx, query, days, limit, 0.4)
 	if err != nil {
-		s.logger.Error("Failed to search transactions", "error", err)
 		return nil, fmt.Errorf("failed to search transactions: %w", err)
 	}
 
 	// Format transactions as text
 	var result string
-	for _, t := range transactions {
+	for _, searchResult := range transactions {
+		t := searchResult.TransactionWithDetails
+
 		result += fmt.Sprintf("%s: %s - %s\n", t.Date, t.Amount, t.Payee)
 		result += fmt.Sprintf("  Type: %s\n", t.Details.Type)
 		if t.Details.Merchant != "" {

@@ -144,7 +144,6 @@ func (d *DB) Init(ctx context.Context) error {
 		}
 	} else {
 		// Apply migrations if database already exists
-		d.logger.Info("Applying database migrations")
 		if err := ApplyMigrations(ctx, d.db, func(msg string, args ...interface{}) {
 			d.logger.Infof(msg, args...)
 		}); err != nil {
@@ -432,18 +431,19 @@ func (d *DB) GetTransactions(ctx context.Context, days int, limit int, offset in
 }
 
 // SearchTransactionsByText performs a full-text search on transactions
-func (d *DB) SearchTransactionsByText(ctx context.Context, query string, days int, limit int) ([]types.TransactionWithDetails, error) {
+func (d *DB) SearchTransactionsByText(ctx context.Context, query string, days int, limit int) ([]types.TransactionSearchResult, error) {
 	searchQuery := `
 		SELECT
 			t.date, t.amount, t.payee, t.bank,
 			t.type, t.merchant, t.location, t.details_category, t.description, t.card_number,
 			t.foreign_amount, t.foreign_currency,
-			t.transfer_to_account, t.transfer_from_account, t.transfer_reference
+			t.transfer_to_account, t.transfer_from_account, t.transfer_reference,
+			bm25(transactions_fts) as text_score
 		FROM transactions t
 		JOIN transactions_fts fts ON t.rowid = fts.rowid
 		WHERE fts.search_body MATCH ?
 		AND t.date >= date('now', ?)
-		ORDER BY rank DESC
+		ORDER BY text_score DESC
 		LIMIT ?
 	`
 
@@ -453,20 +453,56 @@ func (d *DB) SearchTransactionsByText(ctx context.Context, query string, days in
 	}
 	defer rows.Close()
 
-	var transactions []types.TransactionWithDetails
+	var results []types.TransactionSearchResult
 	for rows.Next() {
 		var t types.TransactionWithDetails
-		if err := scanTransactionRow(rows, &t); err != nil {
-			return nil, err
+		var textScore float64
+
+		// Scan all transaction fields plus the text score
+		var date time.Time
+		var amount decimal.Decimal
+		var foreignAmount sql.NullFloat64
+		var foreignCurrency sql.NullString
+		var transferToAccount sql.NullString
+		var transferFromAccount sql.NullString
+		var transferReference sql.NullString
+
+		if err := rows.Scan(
+			&date, &amount, &t.Payee, &t.Bank,
+			&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
+			&foreignAmount, &foreignCurrency,
+			&transferToAccount, &transferFromAccount, &transferReference,
+			&textScore,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan transaction: %w", err)
 		}
-		transactions = append(transactions, t)
+
+		// Format date and amount as strings
+		t.Date = date.Format("02/01/2006")
+		t.Amount = amount.String()
+
+		// Set foreign amount if present
+		setForeignAmount(&t, foreignAmount, foreignCurrency)
+
+		// Set transfer details if present
+		setTransferDetails(&t, transferToAccount, transferFromAccount, transferReference)
+
+		// Create the search result with the text score
+		result := types.TransactionSearchResult{
+			TransactionWithDetails: t,
+			Scores: types.SearchScore{
+				TextScore: textScore,
+			},
+		}
+
+		results = append(results, result)
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating text results: %w", err)
 	}
 
-	return transactions, nil
+	return results, nil
 }
 
 // DB returns the underlying database connection
