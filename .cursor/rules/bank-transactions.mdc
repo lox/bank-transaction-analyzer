@@ -1,0 +1,73 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+# Bank Transaction Analysis Rules
+
+These rules help Cursor understand how to use the bank transaction analysis tools effectively.
+
+## Search Transactions
+
+Search for transactions in your bank history.
+
+### Examples
+- "Show me all transactions at Woolworths in the last 30 days"
+- "Find my recent Uber rides"
+- "Search for transactions containing 'Netflix' in the last 60 days"
+
+### Parameters
+- `query`: The search term or description to look for
+- `days`: Number of days to look back (default: 30)
+- `limit`: Maximum number of results to return (default: 10)
+
+### Tool
+```json
+{
+  "name": "search_transactions",
+  "description": "Search for transactions in your bank history"
+}
+```
+
+## List Transactions
+
+List transactions chronologically with optional filters.
+
+### Examples
+- "Show me my last 20 transactions"
+- "List all purchases in the last week"
+- "Show me transfers to my savings account this month"
+
+### Parameters
+- `days`: Number of days to look back (required)
+- `limit`: Maximum number of results to return (default: 50)
+- `type`: Filter by transaction type (purchase, transfer, fee, deposit, withdrawal, refund, interest)
+- `category`: Filter by transaction category
+
+### Tool
+```json
+{
+  "name": "list_transactions",
+  "description": "List transactions chronologically with optional filters"
+}
+```
+
+## List Categories
+
+List transaction categories and their counts.
+
+### Examples
+- "What are my spending categories this month?"
+- "Show me how many transactions per category in the last 90 days"
+- "List all categories with transaction counts"
+
+### Parameters
+- `days`: Number of days to look back (required)
+
+### Tool
+```json
+{
+  "name": "list_categories",
+  "description": "List all unique transaction categories with their transaction counts"
+}
+```

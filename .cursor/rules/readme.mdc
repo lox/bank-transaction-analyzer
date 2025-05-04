@@ -1,0 +1,6 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+Read the [README.md](mdc:README.md) for details on bank-transaction-analyzer.
