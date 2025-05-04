@@ -123,48 +123,60 @@ func (s *Server) searchTransactionsHandler(ctx context.Context, request mcp.Call
 		}
 	}
 
-	transactions, err := s.analyzer.HybridSearch(ctx, query, days, limit, 0.4)
+	searchResults, err := s.analyzer.HybridSearch(ctx, query, days, limit, 0.4)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search transactions: %w", err)
 	}
 
 	// Format transactions as text
 	var result string
-	for _, searchResult := range transactions {
-		t := searchResult.TransactionWithDetails
+	if len(searchResults.Results) == 0 {
+		result += "No transactions found matching your search.\n"
+	} else {
+		// Show result count information
+		if searchResults.TotalCount > searchResults.Limit {
+			result += fmt.Sprintf("Found %d transactions (showing %d):\n\n",
+				searchResults.TotalCount, len(searchResults.Results))
+		} else {
+			result += fmt.Sprintf("Found %d transactions:\n\n", len(searchResults.Results))
+		}
 
-		result += fmt.Sprintf("%s: %s - %s\n", t.Date, t.Amount, t.Payee)
-		result += fmt.Sprintf("  Type: %s\n", t.Details.Type)
-		if t.Details.Merchant != "" {
-			result += fmt.Sprintf("  Merchant: %s\n", t.Details.Merchant)
-		}
-		if t.Details.Location != "" {
-			result += fmt.Sprintf("  Location: %s\n", t.Details.Location)
-		}
-		if t.Details.Category != "" {
-			result += fmt.Sprintf("  Category: %s\n", t.Details.Category)
-		}
-		if t.Details.Description != "" {
-			result += fmt.Sprintf("  Description: %s\n", t.Details.Description)
-		}
-		if t.Details.CardNumber != "" {
-			result += fmt.Sprintf("  Card Number: %s\n", t.Details.CardNumber)
-		}
-		if t.Details.ForeignAmount != nil {
-			result += fmt.Sprintf("  Foreign Amount: %s %s\n", t.Details.ForeignAmount.Amount, t.Details.ForeignAmount.Currency)
-		}
-		if t.Details.TransferDetails != nil {
-			if t.Details.TransferDetails.ToAccount != "" {
-				result += fmt.Sprintf("  To Account: %s\n", t.Details.TransferDetails.ToAccount)
+		for _, searchResult := range searchResults.Results {
+			t := searchResult.TransactionWithDetails
+
+			result += fmt.Sprintf("%s: %s - %s\n", t.Date, t.Amount, t.Payee)
+			result += fmt.Sprintf("  Type: %s\n", t.Details.Type)
+			if t.Details.Merchant != "" {
+				result += fmt.Sprintf("  Merchant: %s\n", t.Details.Merchant)
 			}
-			if t.Details.TransferDetails.FromAccount != "" {
-				result += fmt.Sprintf("  From Account: %s\n", t.Details.TransferDetails.FromAccount)
+			if t.Details.Location != "" {
+				result += fmt.Sprintf("  Location: %s\n", t.Details.Location)
 			}
-			if t.Details.TransferDetails.Reference != "" {
-				result += fmt.Sprintf("  Reference: %s\n", t.Details.TransferDetails.Reference)
+			if t.Details.Category != "" {
+				result += fmt.Sprintf("  Category: %s\n", t.Details.Category)
 			}
+			if t.Details.Description != "" {
+				result += fmt.Sprintf("  Description: %s\n", t.Details.Description)
+			}
+			if t.Details.CardNumber != "" {
+				result += fmt.Sprintf("  Card Number: %s\n", t.Details.CardNumber)
+			}
+			if t.Details.ForeignAmount != nil {
+				result += fmt.Sprintf("  Foreign Amount: %s %s\n", t.Details.ForeignAmount.Amount, t.Details.ForeignAmount.Currency)
+			}
+			if t.Details.TransferDetails != nil {
+				if t.Details.TransferDetails.ToAccount != "" {
+					result += fmt.Sprintf("  To Account: %s\n", t.Details.TransferDetails.ToAccount)
+				}
+				if t.Details.TransferDetails.FromAccount != "" {
+					result += fmt.Sprintf("  From Account: %s\n", t.Details.TransferDetails.FromAccount)
+				}
+				if t.Details.TransferDetails.Reference != "" {
+					result += fmt.Sprintf("  Reference: %s\n", t.Details.TransferDetails.Reference)
+				}
+			}
+			result += "\n"
 		}
-		result += "\n"
 	}
 
 	return mcp.NewToolResultText(result), nil
@@ -209,6 +221,12 @@ func (s *Server) listTransactionsHandler(ctx context.Context, request mcp.CallTo
 	txType, _ := request.Params.Arguments["type"].(string)
 	category, _ := request.Params.Arguments["category"].(string)
 
+	// First, count total transactions for the period
+	totalCount, err := s.db.CountTransactions(ctx, days)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count transactions: %w", err)
+	}
+
 	// Use GetTransactions with the limit parameter and 0 offset
 	transactions, err := s.db.GetTransactions(ctx, days, limit, 0)
 	if err != nil {
@@ -231,41 +249,66 @@ func (s *Server) listTransactionsHandler(ctx context.Context, request mcp.CallTo
 
 	// Format transactions as text
 	var result string
-	for _, t := range filtered {
-		result += fmt.Sprintf("%s: %s - %s\n", t.Date, t.Amount, t.Payee)
-		result += fmt.Sprintf("  Type: %s\n", t.Details.Type)
-		if t.Details.Merchant != "" {
-			result += fmt.Sprintf("  Merchant: %s\n", t.Details.Merchant)
-		}
-		if t.Details.Category != "" {
-			result += fmt.Sprintf("  Category: %s\n", t.Details.Category)
-		}
-		if t.Details.Description != "" {
-			result += fmt.Sprintf("  Description: %s\n", t.Details.Description)
-		}
-		if t.Details.Location != "" {
-			result += fmt.Sprintf("  Location: %s\n", t.Details.Location)
-		}
-		if t.Details.CardNumber != "" {
-			result += fmt.Sprintf("  Card Number: %s\n", t.Details.CardNumber)
-		}
-		if t.Details.ForeignAmount != nil {
-			result += fmt.Sprintf("  Foreign Amount: %s %s\n",
-				t.Details.ForeignAmount.Amount,
-				t.Details.ForeignAmount.Currency)
-		}
-		if t.Details.TransferDetails != nil {
-			if t.Details.TransferDetails.ToAccount != "" {
-				result += fmt.Sprintf("  To Account: %s\n", t.Details.TransferDetails.ToAccount)
+
+	// Add header showing count information
+	if len(filtered) == 0 {
+		result += "No transactions found matching your criteria.\n\n"
+	} else {
+		// Determine if we're showing limited results
+		if txType != "" || category != "" {
+			// When filtering by type or category, just show the filtered count
+			result += fmt.Sprintf("Found %d transactions", len(filtered))
+			if txType != "" {
+				result += fmt.Sprintf(" of type '%s'", txType)
 			}
-			if t.Details.TransferDetails.FromAccount != "" {
-				result += fmt.Sprintf("  From Account: %s\n", t.Details.TransferDetails.FromAccount)
+			if category != "" {
+				result += fmt.Sprintf(" in category '%s'", category)
 			}
-			if t.Details.TransferDetails.Reference != "" {
-				result += fmt.Sprintf("  Reference: %s\n", t.Details.TransferDetails.Reference)
-			}
+			result += ":\n\n"
+		} else if len(filtered) < totalCount {
+			// When showing fewer than the total due to limit
+			result += fmt.Sprintf("Showing %d of %d transactions (most recent first):\n\n",
+				len(filtered), totalCount)
+		} else {
+			result += fmt.Sprintf("Found %d transactions:\n\n", len(filtered))
 		}
-		result += "\n"
+
+		for _, t := range filtered {
+			result += fmt.Sprintf("%s: %s - %s\n", t.Date, t.Amount, t.Payee)
+			result += fmt.Sprintf("  Type: %s\n", t.Details.Type)
+			if t.Details.Merchant != "" {
+				result += fmt.Sprintf("  Merchant: %s\n", t.Details.Merchant)
+			}
+			if t.Details.Category != "" {
+				result += fmt.Sprintf("  Category: %s\n", t.Details.Category)
+			}
+			if t.Details.Description != "" {
+				result += fmt.Sprintf("  Description: %s\n", t.Details.Description)
+			}
+			if t.Details.Location != "" {
+				result += fmt.Sprintf("  Location: %s\n", t.Details.Location)
+			}
+			if t.Details.CardNumber != "" {
+				result += fmt.Sprintf("  Card Number: %s\n", t.Details.CardNumber)
+			}
+			if t.Details.ForeignAmount != nil {
+				result += fmt.Sprintf("  Foreign Amount: %s %s\n",
+					t.Details.ForeignAmount.Amount,
+					t.Details.ForeignAmount.Currency)
+			}
+			if t.Details.TransferDetails != nil {
+				if t.Details.TransferDetails.ToAccount != "" {
+					result += fmt.Sprintf("  To Account: %s\n", t.Details.TransferDetails.ToAccount)
+				}
+				if t.Details.TransferDetails.FromAccount != "" {
+					result += fmt.Sprintf("  From Account: %s\n", t.Details.TransferDetails.FromAccount)
+				}
+				if t.Details.TransferDetails.Reference != "" {
+					result += fmt.Sprintf("  Reference: %s\n", t.Details.TransferDetails.Reference)
+				}
+			}
+			result += "\n"
+		}
 	}
 
 	return mcp.NewToolResultText(result), nil

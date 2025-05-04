@@ -431,7 +431,23 @@ func (d *DB) GetTransactions(ctx context.Context, days int, limit int, offset in
 }
 
 // SearchTransactionsByText performs a full-text search on transactions
-func (d *DB) SearchTransactionsByText(ctx context.Context, query string, days int, limit int) ([]types.TransactionSearchResult, error) {
+func (d *DB) SearchTransactionsByText(ctx context.Context, query string, days int, limit int) ([]types.TransactionSearchResult, int, error) {
+	// First, get the total count without limit
+	countQuery := `
+		SELECT COUNT(*)
+		FROM transactions t
+		JOIN transactions_fts fts ON t.rowid = fts.rowid
+		WHERE fts.search_body MATCH ?
+		AND t.date >= date('now', ?)
+	`
+
+	var totalCount int
+	err := d.db.QueryRowContext(ctx, countQuery, query, fmt.Sprintf("%d days", -days)).Scan(&totalCount)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to count text search results: %w", err)
+	}
+
+	// Then perform the search with limit
 	searchQuery := `
 		SELECT
 			t.date, t.amount, t.payee, t.bank,
@@ -449,7 +465,7 @@ func (d *DB) SearchTransactionsByText(ctx context.Context, query string, days in
 
 	rows, err := d.db.QueryContext(ctx, searchQuery, query, fmt.Sprintf("%d days", -days), limit)
 	if err != nil {
-		return nil, fmt.Errorf("text search failed: %w", err)
+		return nil, 0, fmt.Errorf("text search failed: %w", err)
 	}
 	defer rows.Close()
 
@@ -474,7 +490,7 @@ func (d *DB) SearchTransactionsByText(ctx context.Context, query string, days in
 			&transferToAccount, &transferFromAccount, &transferReference,
 			&textScore,
 		); err != nil {
-			return nil, fmt.Errorf("failed to scan transaction: %w", err)
+			return nil, 0, fmt.Errorf("failed to scan transaction: %w", err)
 		}
 
 		// Format date and amount as strings
@@ -499,10 +515,10 @@ func (d *DB) SearchTransactionsByText(ctx context.Context, query string, days in
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating text results: %w", err)
+		return nil, 0, fmt.Errorf("error iterating text results: %w", err)
 	}
 
-	return results, nil
+	return results, totalCount, nil
 }
 
 // DB returns the underlying database connection
@@ -608,4 +624,18 @@ func setTransferDetails(t *types.TransactionWithDetails, toAccount, fromAccount,
 			Reference:   reference.String,
 		}
 	}
+}
+
+// CountTransactions returns the number of transactions from last N days
+func (d *DB) CountTransactions(ctx context.Context, days int) (int, error) {
+	var count int
+	err := d.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM transactions
+		WHERE date >= date('now', ? || ' days')
+	`, -days).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count transactions: %w", err)
+	}
+
+	return count, nil
 }

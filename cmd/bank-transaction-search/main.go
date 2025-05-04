@@ -121,19 +121,25 @@ func (c *CLI) setupVectorComponents(ctx context.Context, logger *log.Logger, dat
 
 // performTextSearch performs a full-text search and displays results
 func (c *CLI) performTextSearch(ctx context.Context, database *db.DB, logger *log.Logger) error {
-	searchResults, err := database.SearchTransactionsByText(ctx, c.Query, c.Days, c.Limit)
+	results, totalCount, err := database.SearchTransactionsByText(ctx, c.Query, c.Days, c.Limit)
 	if err != nil {
 		logger.Fatal("Failed to search transactions", "error", err)
 	}
 
 	// Print results
-	if len(searchResults) == 0 {
+	if len(results) == 0 {
 		fmt.Println("No transactions found")
 		return nil
 	}
 
-	fmt.Printf("Found %d transactions:\n\n", len(searchResults))
-	for _, result := range searchResults {
+	// Display total count information
+	if len(results) < totalCount {
+		fmt.Printf("Found %d transactions (showing %d):\n\n", totalCount, len(results))
+	} else {
+		fmt.Printf("Found %d transactions:\n\n", len(results))
+	}
+
+	for _, result := range results {
 		t := result.TransactionWithDetails
 		fmt.Printf("%s: %s - %s (text score: %.2f)\n", t.Date, t.Amount, t.Payee, result.Scores.TextScore)
 		printTransactionDetails(t)
@@ -150,14 +156,19 @@ func (c *CLI) performVectorSearch(ctx context.Context, txAnalyzer *analyzer.Anal
 	}
 
 	// Print results
-	if len(searchResults) == 0 {
+	if len(searchResults.Results) == 0 {
 		fmt.Println("No transactions found")
 		return nil
 	}
 
-	fmt.Printf("Found %d transactions:\n\n", len(searchResults))
+	// Display total count information
+	if searchResults.TotalCount > len(searchResults.Results) {
+		fmt.Printf("Found %d transactions (showing %d):\n\n", searchResults.TotalCount, len(searchResults.Results))
+	} else {
+		fmt.Printf("Found %d transactions:\n\n", len(searchResults.Results))
+	}
 
-	for _, result := range searchResults {
+	for _, result := range searchResults.Results {
 		t := result.TransactionWithDetails
 		fmt.Printf("%s: %s - %s (similarity: %.2f)\n", t.Date, t.Amount, t.Payee, result.Scores.VectorScore)
 		printTransactionDetails(t)
@@ -174,14 +185,19 @@ func (c *CLI) performHybridSearch(ctx context.Context, txAnalyzer *analyzer.Anal
 	}
 
 	// Print results
-	if len(searchResults) == 0 {
+	if len(searchResults.Results) == 0 {
 		fmt.Println("No transactions found")
 		return nil
 	}
 
-	fmt.Printf("Found %d transactions:\n\n", len(searchResults))
+	// Display total count information
+	if searchResults.TotalCount > len(searchResults.Results) {
+		fmt.Printf("Found %d transactions (showing %d):\n\n", searchResults.TotalCount, len(searchResults.Results))
+	} else {
+		fmt.Printf("Found %d transactions:\n\n", len(searchResults.Results))
+	}
 
-	for _, result := range searchResults {
+	for _, result := range searchResults.Results {
 		t := result.TransactionWithDetails
 		fmt.Printf("%s: %s - %s (score: %.4f)\n", t.Date, t.Amount, t.Payee, result.Scores.RRFScore)
 

@@ -129,12 +129,15 @@ func TestSearchTransactions(t *testing.T) {
 	}
 
 	// Test text search
-	textResults, err := db.SearchTransactionsByText(ctx, "coffee", 30, 10)
+	textResults, totalCount, err := db.SearchTransactionsByText(ctx, "coffee", 30, 10)
 	if err != nil {
 		t.Fatalf("Failed to search transactions: %v", err)
 	}
 	if len(textResults) != 1 {
 		t.Fatalf("Expected 1 result, got %d", len(textResults))
+	}
+	if totalCount != 1 {
+		t.Fatalf("Expected total count of 1, got %d", totalCount)
 	}
 	if textResults[0].TransactionWithDetails.Details.Merchant != "Coffee Shop" {
 		t.Errorf("Expected merchant 'Coffee Shop', got '%s'", textResults[0].TransactionWithDetails.Details.Merchant)

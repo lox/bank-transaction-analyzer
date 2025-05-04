@@ -12,3 +12,10 @@ type TransactionSearchResult struct {
 	TransactionWithDetails
 	Scores SearchScore `json:"scores"`
 }
+
+// SearchResults wraps search results with metadata about the total count
+type SearchResults struct {
+	Results    []TransactionSearchResult `json:"results"`     // Limited set of search results
+	TotalCount int                       `json:"total_count"` // Total count of all matching results
+	Limit      int                       `json:"limit"`       // Limit that was applied to the search
+}

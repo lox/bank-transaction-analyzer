@@ -546,7 +546,7 @@ func (a *Analyzer) TextSearch(
 	query string,
 	days int,
 	limit int,
-) ([]types.TransactionSearchResult, error) {
+) (types.SearchResults, error) {
 	a.logger.Info("Performing text search",
 		"query", query,
 		"days", days,
@@ -554,17 +554,22 @@ func (a *Analyzer) TextSearch(
 	startTime := time.Now()
 
 	// Perform text search using the database
-	searchResults, err := a.db.SearchTransactionsByText(ctx, query, days, limit)
+	searchResults, totalCount, err := a.db.SearchTransactionsByText(ctx, query, days, limit)
 	if err != nil {
-		return nil, fmt.Errorf("failed to search transactions by text: %w", err)
+		return types.SearchResults{}, fmt.Errorf("failed to search transactions by text: %w", err)
 	}
 
 	a.logger.Info("Text search completed",
 		"query", query,
 		"results", len(searchResults),
+		"total_count", totalCount,
 		"duration", time.Since(startTime))
 
-	return searchResults, nil
+	return types.SearchResults{
+		Results:    searchResults,
+		TotalCount: totalCount,
+		Limit:      limit,
+	}, nil
 }
 
 // VectorSearch finds transactions similar to the given query using vector embeddings
@@ -574,7 +579,7 @@ func (a *Analyzer) VectorSearch(
 	limit int,
 	threshold float32,
 	days int,
-) ([]types.TransactionSearchResult, error) {
+) (types.SearchResults, error) {
 	a.logger.Info("Performing vector search",
 		"query", query,
 		"limit", limit,
@@ -585,13 +590,13 @@ func (a *Analyzer) VectorSearch(
 	// Generate embedding for the query
 	embedding, err := a.embeddings.GenerateEmbedding(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate embedding for query: %w", err)
+		return types.SearchResults{}, fmt.Errorf("failed to generate embedding for query: %w", err)
 	}
 
 	// Query similar transaction IDs from vector storage with threshold applied
 	vectorResults, err := a.vectors.Query(ctx, embedding, threshold)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query similar transactions: %w", err)
+		return types.SearchResults{}, fmt.Errorf("failed to query similar transactions: %w", err)
 	}
 
 	a.logger.Debug("Vector search raw results",
@@ -602,8 +607,15 @@ func (a *Analyzer) VectorSearch(
 	// If no results from vector search, return empty slice
 	if len(vectorResults) == 0 {
 		a.logger.Info("No similar transactions found", "duration", time.Since(startTime))
-		return []types.TransactionSearchResult{}, nil
+		return types.SearchResults{
+			Results:    []types.TransactionSearchResult{},
+			TotalCount: 0,
+			Limit:      limit,
+		}, nil
 	}
+
+	// Total count of vector results before applying date filter and limit
+	totalVectorResults := len(vectorResults)
 
 	// Fetch each transaction by ID and build result set
 	var results []types.TransactionSearchResult
@@ -655,15 +667,27 @@ func (a *Analyzer) VectorSearch(
 		}
 	}
 
+	// Calculate total count as the sum of results, fetch errors, and date-filtered items
+	totalCount := len(results)
+	if len(results) >= limit || fetchErrors > 0 || filteredOutByDate > 0 {
+		// If we hit the limit or had errors/filtering, use the pre-filtered count
+		totalCount = totalVectorResults - fetchErrors
+	}
+
 	a.logger.Info("Vector search completed",
 		"query", query,
 		"results", len(results),
+		"total_count", totalCount,
 		"fetch_errors", fetchErrors,
 		"filtered_by_date", filteredOutByDate,
 		"threshold", threshold,
 		"duration", time.Since(startTime))
 
-	return results, nil
+	return types.SearchResults{
+		Results:    results,
+		TotalCount: totalCount,
+		Limit:      limit,
+	}, nil
 }
 
 // HybridSearch performs both text and vector searches and combines results using Reciprocal Rank Fusion (RRF)
@@ -673,7 +697,7 @@ func (a *Analyzer) HybridSearch(
 	days int,
 	limit int,
 	vectorThreshold float32,
-) ([]types.TransactionSearchResult, error) {
+) (types.SearchResults, error) {
 	a.logger.Info("Performing hybrid search with Reciprocal Rank Fusion",
 		"query", query,
 		"days", days,
@@ -682,25 +706,30 @@ func (a *Analyzer) HybridSearch(
 	startTime := time.Now()
 
 	// Perform text search
-	textResults, err := a.db.SearchTransactionsByText(ctx, query, days, limit*2) // Get more results for better fusion
+	textResults, textTotalCount, err := a.db.SearchTransactionsByText(ctx, query, days, limit*2) // Get more results for better fusion
 	if err != nil {
-		return nil, fmt.Errorf("text search failed: %w", err)
+		return types.SearchResults{}, fmt.Errorf("text search failed: %w", err)
 	}
 
 	// Perform vector search
 	vectorResults, err := a.VectorSearch(ctx, query, limit, vectorThreshold, days)
 	if err != nil {
-		return nil, fmt.Errorf("vector search failed: %w", err)
+		return types.SearchResults{}, fmt.Errorf("vector search failed: %w", err)
 	}
 
 	a.logger.Debug("Hybrid search raw results",
 		"text_results", len(textResults),
-		"vector_results", len(vectorResults))
+		"vector_results", len(vectorResults.Results),
+		"text_total_count", textTotalCount)
 
 	// No results from either search
-	if len(textResults) == 0 && len(vectorResults) == 0 {
+	if len(textResults) == 0 && len(vectorResults.Results) == 0 {
 		a.logger.Info("No results found in hybrid search", "duration", time.Since(startTime))
-		return []types.TransactionSearchResult{}, nil
+		return types.SearchResults{
+			Results:    []types.TransactionSearchResult{},
+			TotalCount: 0,
+			Limit:      limit,
+		}, nil
 	}
 
 	// Map of transaction IDs to their search results and rankings
@@ -735,7 +764,7 @@ func (a *Analyzer) HybridSearch(
 	}
 
 	// Process vector search results
-	for i, result := range vectorResults {
+	for i, result := range vectorResults.Results {
 		// Generate transaction ID
 		txID := db.GenerateTransactionID(result.Transaction)
 
@@ -779,6 +808,15 @@ func (a *Analyzer) HybridSearch(
 	// Sort results by RRF score (highest first)
 	sortSearchResultsByRRFScore(finalResults)
 
+	// Calculate the total count - use the larger of text and vector search totals
+	totalCount := textTotalCount
+	if vectorResults.TotalCount > totalCount {
+		totalCount = vectorResults.TotalCount
+	}
+
+	// Return full results set before limiting for total count
+	allResultsCount := len(finalResults)
+
 	// Limit results if needed
 	if len(finalResults) > limit {
 		finalResults = finalResults[:limit]
@@ -787,9 +825,14 @@ func (a *Analyzer) HybridSearch(
 	a.logger.Info("Hybrid search completed",
 		"query", query,
 		"results", len(finalResults),
+		"total_count", allResultsCount,
 		"duration", time.Since(startTime))
 
-	return finalResults, nil
+	return types.SearchResults{
+		Results:    finalResults,
+		TotalCount: allResultsCount,
+		Limit:      limit,
+	}, nil
 }
 
 // sortSearchResultsByRRFScore sorts search results by their RRF score (highest first)
