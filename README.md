@@ -82,7 +82,7 @@ After activating Hermit, the following commands are available in your PATH:
 #### Bank Transaction Analyzer
 
 ```bash
-bank-transaction-analyzer process --qif-file Transactions.qif [options]
+bank-transaction-analyzer --qif-file Transactions.qif [options]
 ```
 
 Options:
@@ -97,13 +97,16 @@ Options:
 #### Bank Transaction Search
 
 ```bash
-bank-transaction-search "query" [options]
+bank-transaction-search --query "query" [options]
 ```
 
 Options:
 - `--days`: Search window in days (default: 30)
 - `--limit`: Maximum results to return (default: 10)
 - `--data-dir`: Data directory path
+- `--vector`: Use vector search (default: false)
+- `--similarity-threshold`: Minimum similarity score for vector search (default: 0.5)
+- `--show-both`: Show both vector and text search results (default: false)
 
 ### MCP Server
 
@@ -127,16 +130,14 @@ Available tools:
 ```
 data/
   ├── transactions.db    # SQLite database
-  ├── transactions_fts   # Full-text search index
-  └── transactions_vec   # Vector similarity index
+  ├── chromem_db         # Chroma vector database
 ```
 
 ## Data Storage
 
-All transaction data is stored in a single SQLite database at `data/transactions.db`. The database uses two specialized virtual tables for search:
+All transaction data is stored in a single SQLite database at `data/transactions.db`. The database uses a specialized virtual table for search:
 
 1. `transactions_fts`: A full-text search table using SQLite FTS5
-2. `transactions_vec`: A vector similarity table using sqlite-vec for semantic search
 
 The main transactions table schema:
 
@@ -161,23 +162,6 @@ CREATE TABLE transactions (
 ```
 
 ## Search Capabilities
-
-The tool implements a hybrid search system combining:
-
-1. **Full-text Search (FTS5)**
-   - Exact and partial text matches
-   - SQLite FTS5 syntax support
-   - Configurable search weights
-
-2. **Vector Similarity Search (sqlite-vec)**
-   - Semantic matching using Snowflake Arctic Embed v1.5
-   - Local embeddings generation via llama.cpp
-   - Cosine similarity scoring
-
-3. **Reciprocal Rank Fusion (RRF)**
-   - Combines both search methods
-   - Weighted towards semantic matches
-   - Formula: `RRF_score = (2.0 / (k + vector_score)) + (1.0 / (k + text_score))`
 
 ### Embeddings Generation
 
