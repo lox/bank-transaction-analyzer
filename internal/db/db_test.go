@@ -18,23 +18,27 @@ func setupTestDB(t *testing.T) (*DB, func()) {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
 
-	// Create a logger that discards output
+	// Initialize logger
 	logger := log.New(io.Discard)
-	logger.SetLevel(log.DebugLevel)
 
-	// Create a new database connection
-	db, err := New(tempDir, logger, time.Local)
+	// Initialize timezone
+	loc, err := time.LoadLocation("UTC")
 	if err != nil {
+		t.Fatalf("failed to load UTC timezone: %v", err)
+	}
+
+	// Create database
+	db, err := New(tempDir, logger, loc)
+	if err != nil {
+		os.RemoveAll(tempDir)
 		t.Fatalf("failed to create database: %v", err)
 	}
 
-	// Return cleanup function
-	cleanup := func() {
+	// Return database and cleanup function
+	return db, func() {
 		db.Close()
 		os.RemoveAll(tempDir)
 	}
-
-	return db, cleanup
 }
 
 func TestStoreAndGetTransaction(t *testing.T) {
@@ -47,54 +51,50 @@ func TestStoreAndGetTransaction(t *testing.T) {
 	transaction := types.Transaction{
 		Date:   "01/01/2023",
 		Amount: "100.00",
-		Payee:  "Test Store",
+		Payee:  "Test Payee",
 		Bank:   "Test Bank",
 	}
 
 	details := &types.TransactionDetails{
 		Type:        "purchase",
-		Merchant:    "Test Store",
+		Merchant:    "Test Merchant",
 		Location:    "Test Location",
-		Category:    "Shopping",
-		Description: "Test purchase",
+		Category:    "Test Category",
+		Description: "Test Description",
 		CardNumber:  "1234",
-		SearchBody:  "Test Store Test Location Test purchase",
+		SearchBody:  "Test Merchant Test Location Test Description",
 	}
 
-	// Store the transaction
+	// Store transaction
 	err := db.Store(ctx, transaction, details)
 	if err != nil {
 		t.Fatalf("failed to store transaction: %v", err)
 	}
 
-	// Retrieve the transaction
+	// Retrieve transaction
 	retrievedDetails, err := db.Get(ctx, transaction)
 	if err != nil {
 		t.Fatalf("failed to get transaction: %v", err)
 	}
 
-	if retrievedDetails == nil {
-		t.Fatal("expected to find transaction details, got nil")
-	}
-
-	// Verify the details
+	// Verify details
 	if retrievedDetails.Type != details.Type {
-		t.Errorf("expected type %q, got %q", details.Type, retrievedDetails.Type)
+		t.Errorf("expected type %s, got %s", details.Type, retrievedDetails.Type)
 	}
 	if retrievedDetails.Merchant != details.Merchant {
-		t.Errorf("expected merchant %q, got %q", details.Merchant, retrievedDetails.Merchant)
+		t.Errorf("expected merchant %s, got %s", details.Merchant, retrievedDetails.Merchant)
 	}
 	if retrievedDetails.Location != details.Location {
-		t.Errorf("expected location %q, got %q", details.Location, retrievedDetails.Location)
+		t.Errorf("expected location %s, got %s", details.Location, retrievedDetails.Location)
 	}
 	if retrievedDetails.Category != details.Category {
-		t.Errorf("expected category %q, got %q", details.Category, retrievedDetails.Category)
+		t.Errorf("expected category %s, got %s", details.Category, retrievedDetails.Category)
 	}
 	if retrievedDetails.Description != details.Description {
-		t.Errorf("expected description %q, got %q", details.Description, retrievedDetails.Description)
+		t.Errorf("expected description %s, got %s", details.Description, retrievedDetails.Description)
 	}
 	if retrievedDetails.CardNumber != details.CardNumber {
-		t.Errorf("expected card number %q, got %q", details.CardNumber, retrievedDetails.CardNumber)
+		t.Errorf("expected card number %s, got %s", details.CardNumber, retrievedDetails.CardNumber)
 	}
 }
 
@@ -137,24 +137,6 @@ func TestSearchTransactions(t *testing.T) {
 	}
 	if textResults[0].Details.Merchant != "Coffee Shop" {
 		t.Errorf("Expected merchant 'Coffee Shop', got '%s'", textResults[0].Details.Merchant)
-	}
-
-	// Test hybrid search
-	mockEmbedding := make([]float32, 768)
-	serializedEmbedding, err := db.SerializeEmbedding(mockEmbedding)
-	if err != nil {
-		t.Fatalf("Failed to serialize embedding: %v", err)
-	}
-
-	results, err := db.SearchTransactions(ctx, "coffee", serializedEmbedding, 30, 10)
-	if err != nil {
-		t.Fatalf("Failed to search transactions: %v", err)
-	}
-	if len(results) != 1 {
-		t.Fatalf("Expected 1 result, got %d", len(results))
-	}
-	if results[0].TransactionWithDetails.Details.Merchant != "Coffee Shop" {
-		t.Errorf("Expected merchant 'Coffee Shop', got '%s'", results[0].TransactionWithDetails.Details.Merchant)
 	}
 }
 

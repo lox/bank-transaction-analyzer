@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/charmbracelet/log"
-	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
 	"github.com/lox/bank-transaction-analyzer/internal/db"
 	"github.com/lox/bank-transaction-analyzer/internal/types"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -143,26 +142,8 @@ func (s *Server) searchTransactionsHandler(ctx context.Context, request mcp.Call
 		}
 	}
 
-	// Generate embedding for the query
-	config := analyzer.NewLlamaCppConfig().WithLogger(s.logger)
-	embeddings, err := analyzer.NewLlamaCppEmbeddingProvider(config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create embedding provider: %w", err)
-	}
-
-	embedding, err := embeddings.GenerateEmbedding(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate embedding: %w", err)
-	}
-
-	// Serialize the embedding for sqlite-vec
-	serializedEmbedding, err := s.db.SerializeEmbedding(embedding)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize embedding: %w", err)
-	}
-
 	s.logger.Debug("Searching transactions", "query", query, "days", days, "limit", limit)
-	transactions, err := s.db.SearchTransactions(ctx, query, serializedEmbedding, days, limit)
+	transactions, err := s.db.SearchTransactionsByText(ctx, query, days, limit)
 	if err != nil {
 		s.logger.Error("Failed to search transactions", "error", err)
 		return nil, fmt.Errorf("failed to search transactions: %w", err)
@@ -202,15 +183,6 @@ func (s *Server) searchTransactionsHandler(ctx context.Context, request mcp.Call
 				result += fmt.Sprintf("  Reference: %s\n", t.Details.TransferDetails.Reference)
 			}
 		}
-		// Add search scores
-		result += "  Search Scores:\n"
-		if t.Scores.VectorScore != 0 {
-			result += fmt.Sprintf("    Vector Score: %.4f\n", t.Scores.VectorScore)
-		}
-		if t.Scores.TextScore != 0 {
-			result += fmt.Sprintf("    Text Score: %.4f\n", t.Scores.TextScore)
-		}
-		result += fmt.Sprintf("    RRF Score: %.4f\n", t.Scores.RRFScore)
 		result += "\n"
 	}
 

@@ -8,7 +8,6 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/charmbracelet/log"
-	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
 	"github.com/lox/bank-transaction-analyzer/internal/db"
 )
 
@@ -45,27 +44,8 @@ func (c *CLI) Run() error {
 	}
 	defer database.Close()
 
-	// Create embedding provider for search
-	config := analyzer.NewLlamaCppConfig().WithLogger(logger)
-	embeddings, err := analyzer.NewLlamaCppEmbeddingProvider(config)
-	if err != nil {
-		logger.Fatal("Failed to create embedding provider", "error", err)
-	}
-
-	// Generate embedding for the query
-	embedding, err := embeddings.GenerateEmbedding(context.Background(), c.Query)
-	if err != nil {
-		logger.Fatal("Failed to generate embedding", "error", err)
-	}
-
-	// Serialize the embedding for sqlite-vec
-	serializedEmbedding, err := database.SerializeEmbedding(embedding)
-	if err != nil {
-		logger.Fatal("Failed to serialize embedding", "error", err)
-	}
-
-	// Search transactions
-	transactions, err := database.SearchTransactions(context.Background(), c.Query, serializedEmbedding, c.Days, c.Limit)
+	// Search transactions using full-text search
+	transactions, err := database.SearchTransactionsByText(context.Background(), c.Query, c.Days, c.Limit)
 	if err != nil {
 		logger.Fatal("Failed to search transactions", "error", err)
 	}
@@ -109,15 +89,6 @@ func (c *CLI) Run() error {
 				fmt.Printf("  Reference: %s\n", t.Details.TransferDetails.Reference)
 			}
 		}
-		// Add search scores
-		fmt.Printf("  Search Scores:\n")
-		if t.Scores.VectorScore != 0 {
-			fmt.Printf("    Vector Score: %.4f\n", t.Scores.VectorScore)
-		}
-		if t.Scores.TextScore != 0 {
-			fmt.Printf("    Text Score: %.4f\n", t.Scores.TextScore)
-		}
-		fmt.Printf("    RRF Score: %.4f\n", t.Scores.RRFScore)
 		fmt.Println()
 	}
 
@@ -127,8 +98,8 @@ func (c *CLI) Run() error {
 func main() {
 	var cli CLI
 	ctx := kong.Parse(&cli,
-		kong.Name("ing-transaction-search"),
-		kong.Description("Search for transactions in your ING transaction history"),
+		kong.Name("bank-transaction-search"),
+		kong.Description("Search for transactions in your bank transaction history"),
 		kong.UsageOnError(),
 	)
 

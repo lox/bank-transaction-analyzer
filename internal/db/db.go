@@ -6,13 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
-	"sync"
 	"time"
 
-	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/ncruces"
-	_ "github.com/ncruces/go-sqlite3"
 	_ "github.com/ncruces/go-sqlite3/driver"
+	_ "github.com/ncruces/go-sqlite3/embed"
 
 	"github.com/shopspring/decimal"
 
@@ -22,6 +19,62 @@ import (
 	"github.com/charmbracelet/log"
 	"github.com/lox/bank-transaction-analyzer/internal/types"
 )
+
+// Schema defines the database schema
+var schema = `
+CREATE TABLE IF NOT EXISTS transactions (
+	id TEXT PRIMARY KEY,
+	date DATE NOT NULL,
+	amount DECIMAL(15,2) NOT NULL,
+	payee TEXT NOT NULL,
+	bank TEXT NOT NULL,
+	-- Transaction details
+	type TEXT NOT NULL,
+	merchant TEXT NOT NULL,
+	location TEXT,
+	details_category TEXT,
+	description TEXT,
+	card_number TEXT,
+	search_body TEXT,
+	-- Foreign amount details
+	foreign_amount DECIMAL(15,2),
+	foreign_currency TEXT,
+	-- Transfer details
+	transfer_to_account TEXT,
+	transfer_from_account TEXT,
+	transfer_reference TEXT
+);
+
+-- Create virtual table for full-text search
+CREATE VIRTUAL TABLE IF NOT EXISTS transactions_fts USING fts5(
+	search_body,
+	content='transactions',
+	content_rowid='rowid'
+);
+
+-- Create trigger to keep FTS table in sync
+CREATE TRIGGER IF NOT EXISTS transactions_ai AFTER INSERT ON transactions BEGIN
+	INSERT INTO transactions_fts(rowid, search_body) VALUES (new.rowid, new.search_body);
+END;
+
+CREATE TRIGGER IF NOT EXISTS transactions_ad AFTER DELETE ON transactions BEGIN
+	DELETE FROM transactions_fts WHERE rowid = old.rowid;
+END;
+
+CREATE TRIGGER IF NOT EXISTS transactions_au AFTER UPDATE ON transactions BEGIN
+	DELETE FROM transactions_fts WHERE rowid = old.rowid;
+	INSERT INTO transactions_fts(rowid, search_body) VALUES (new.rowid, new.search_body);
+END;
+
+-- Create indexes for faster lookups
+CREATE INDEX IF NOT EXISTS idx_transactions_payee ON transactions(payee);
+CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date);
+CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(type);
+CREATE INDEX IF NOT EXISTS idx_transactions_merchant ON transactions(merchant);
+CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(details_category);
+CREATE INDEX IF NOT EXISTS idx_transactions_amount ON transactions(amount);
+CREATE INDEX IF NOT EXISTS idx_transactions_bank ON transactions(bank);
+`
 
 // DB represents a SQLite database connection
 type DB struct {
@@ -59,93 +112,43 @@ func New(dataDir string, logger *log.Logger, timezone *time.Location) (*DB, erro
 		timezone: timezone,
 	}
 
-	// Create tables if they don't exist
-	if err := createTables(db); err != nil {
-		return nil, fmt.Errorf("failed to create tables: %v", err)
+	// Initialize database schema and apply migrations
+	if err := d.Init(context.Background()); err != nil {
+		return nil, fmt.Errorf("failed to initialize database: %v", err)
 	}
 
 	return d, nil
 }
 
-// createTables creates the necessary tables in the database
-func createTables(db *sql.DB) error {
-	// Create transactions table
-	_, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS transactions (
-			id TEXT PRIMARY KEY,
-			date DATE NOT NULL,
-			amount DECIMAL(15,2) NOT NULL,
-			payee TEXT NOT NULL,
-			bank TEXT NOT NULL,
-			-- Transaction details
-			type TEXT NOT NULL,
-			merchant TEXT NOT NULL,
-			location TEXT,
-			details_category TEXT,
-			description TEXT,
-			card_number TEXT,
-			search_body TEXT,
-			-- Foreign amount details
-			foreign_amount DECIMAL(15,2),
-			foreign_currency TEXT,
-			-- Transfer details
-			transfer_to_account TEXT,
-			transfer_from_account TEXT,
-			transfer_reference TEXT
-		);
+// Init initializes the database with the schema and applies migrations
+func (d *DB) Init(ctx context.Context) error {
+	// Check if the database exists by checking for transactions table
+	var exists bool
+	err := d.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM sqlite_master
+			WHERE type='table' AND name='transactions'
+		)
+	`).Scan(&exists)
 
-		-- Create virtual table for full-text search
-		CREATE VIRTUAL TABLE IF NOT EXISTS transactions_fts USING fts5(
-			search_body,
-			content='transactions',
-			content_rowid='rowid'
-		);
-
-		-- Create virtual table for vector embeddings
-		CREATE VIRTUAL TABLE IF NOT EXISTS transactions_vec USING vec0(
-			embedding FLOAT[768]
-		);
-
-		-- Create trigger to keep FTS table in sync
-		CREATE TRIGGER IF NOT EXISTS transactions_ai AFTER INSERT ON transactions BEGIN
-			INSERT INTO transactions_fts(rowid, search_body) VALUES (new.rowid, new.search_body);
-		END;
-
-		CREATE TRIGGER IF NOT EXISTS transactions_ad AFTER DELETE ON transactions BEGIN
-			DELETE FROM transactions_fts WHERE rowid = old.rowid;
-			DELETE FROM transactions_vec WHERE rowid = old.rowid;
-		END;
-
-		CREATE TRIGGER IF NOT EXISTS transactions_au AFTER UPDATE ON transactions BEGIN
-			DELETE FROM transactions_fts WHERE rowid = old.rowid;
-			DELETE FROM transactions_vec WHERE rowid = old.rowid;
-			INSERT INTO transactions_fts(rowid, search_body) VALUES (new.rowid, new.search_body);
-		END;
-
-		-- Create a view to help debug FTS issues
-		CREATE VIEW IF NOT EXISTS transactions_with_fts AS
-		SELECT t.rowid, t.id, t.search_body, fts.rowid as fts_rowid
-		FROM transactions t
-		LEFT JOIN transactions_fts fts ON t.rowid = fts.rowid;
-	`)
 	if err != nil {
-		return fmt.Errorf("failed to create transactions table: %v", err)
+		return fmt.Errorf("failed to check if database exists: %v", err)
 	}
 
-	// Create indexes for faster lookups
-	indexes := []string{
-		"CREATE INDEX IF NOT EXISTS idx_transactions_payee ON transactions(payee)",
-		"CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date)",
-		"CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(type)",
-		"CREATE INDEX IF NOT EXISTS idx_transactions_merchant ON transactions(merchant)",
-		"CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(details_category)",
-		"CREATE INDEX IF NOT EXISTS idx_transactions_amount ON transactions(amount)",
-		"CREATE INDEX IF NOT EXISTS idx_transactions_bank ON transactions(bank)",
-	}
-
-	for _, index := range indexes {
-		if _, err := db.Exec(index); err != nil {
-			return fmt.Errorf("failed to create index: %v", err)
+	// Initialize database schema if it doesn't exist
+	if !exists {
+		d.logger.Info("Creating database schema")
+		if _, err := d.db.ExecContext(ctx, schema); err != nil {
+			return fmt.Errorf("failed to create database schema: %v", err)
+		}
+	} else {
+		// Apply migrations if database already exists
+		d.logger.Info("Applying database migrations")
+		if err := ApplyMigrations(ctx, d.db, func(msg string, args ...interface{}) {
+			d.logger.Infof(msg, args...)
+		}); err != nil {
+			return fmt.Errorf("failed to apply migrations: %v", err)
 		}
 	}
 
@@ -201,7 +204,7 @@ func (d *DB) Store(ctx context.Context, t types.Transaction, details *types.Tran
 
 	// Check FTS status
 	var ftsRowid sql.NullInt64
-	err = d.db.QueryRowContext(ctx, "SELECT fts_rowid FROM transactions_with_fts WHERE id = ?", id).Scan(&ftsRowid)
+	err = d.db.QueryRowContext(ctx, "SELECT rowid FROM transactions_fts WHERE rowid = ?", rowid).Scan(&ftsRowid)
 	if err != nil {
 		d.logger.Warn("Failed to check FTS status", "id", id, "error", err)
 	} else {
@@ -398,204 +401,19 @@ func (d *DB) GetTransactions(ctx context.Context, days int) ([]types.Transaction
 	return transactions, nil
 }
 
-// SearchTransactions performs a hybrid search combining vector and text search using RRF
-func (d *DB) SearchTransactions(ctx context.Context, query string, embedding []byte, days int, limit int) ([]types.TransactionSearchResult, error) {
-	// Constants for RRF algorithm
-	const (
-		rrf_k = 60 // Constant k in RRF formula, typically between 60-80
-		// Weights for different search methods
-		vectorWeight = 2.0 // Higher weight for vector similarity
-		textWeight   = 1.0 // Base weight for text search
-	)
-
-	// Create a wait group for parallel execution
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// Channel to collect results and errors
-	vectorResults := make(chan []types.TransactionSearchResult, 1)
-	textResults := make(chan []types.TransactionSearchResult, 1)
-	vectorErr := make(chan error, 1)
-	textErr := make(chan error, 1)
-
-	// Run vector search
-	go func() {
-		defer wg.Done()
-		results, err := d.runVectorSearch(ctx, embedding, days, limit)
-		if err != nil {
-			vectorErr <- err
-			return
-		}
-		vectorResults <- results
-	}()
-
-	// Run text search
-	go func() {
-		defer wg.Done()
-		results, err := d.runTextSearch(ctx, query, days, limit)
-		if err != nil {
-			textErr <- err
-			return
-		}
-		textResults <- results
-	}()
-
-	// Wait for both searches to complete
-	wg.Wait()
-
-	// Check for errors
-	select {
-	case err := <-vectorErr:
-		return nil, fmt.Errorf("vector search failed: %w", err)
-	case err := <-textErr:
-		return nil, fmt.Errorf("text search failed: %w", err)
-	default:
-	}
-
-	// Get results
-	vectorMatches := <-vectorResults
-	textMatches := <-textResults
-
-	// Combine results using RRF
-	transactionScores := make(map[string]*types.TransactionSearchResult)
-
-	// Process vector results
-	for _, result := range vectorMatches {
-		id := GenerateTransactionID(result.Transaction)
-		if _, exists := transactionScores[id]; !exists {
-			transactionScores[id] = &result
-		}
-	}
-
-	// Process text results
-	for _, result := range textMatches {
-		id := GenerateTransactionID(result.Transaction)
-		if existing, exists := transactionScores[id]; exists {
-			// Merge scores
-			existing.Scores.TextScore = result.Scores.TextScore
-		} else {
-			transactionScores[id] = &result
-		}
-	}
-
-	// Calculate RRF scores
-	var combinedResults []types.TransactionSearchResult
-	for _, result := range transactionScores {
-		// Calculate RRF score using both vector and text scores
-		vectorRRF := vectorWeight / (float64(rrf_k) + result.Scores.VectorScore)
-		textRRF := textWeight / (float64(rrf_k) + result.Scores.TextScore)
-
-		// Combine scores with adjusted weights
-		result.Scores.RRFScore = vectorRRF + textRRF
-		combinedResults = append(combinedResults, *result)
-	}
-
-	// Sort by RRF score
-	sort.Slice(combinedResults, func(i, j int) bool {
-		return combinedResults[i].Scores.RRFScore > combinedResults[j].Scores.RRFScore
-	})
-
-	// Limit results
-	if len(combinedResults) > limit {
-		combinedResults = combinedResults[:limit]
-	}
-
-	return combinedResults, nil
-}
-
-// runVectorSearch performs a vector similarity search
-func (d *DB) runVectorSearch(ctx context.Context, embedding []byte, days int, limit int) ([]types.TransactionSearchResult, error) {
-	query := `
-		WITH vec_matches AS (
-			SELECT
-				rowid as transaction_id,
-				row_number() OVER (ORDER BY distance) as rank_number,
-				distance
-			FROM transactions_vec
-			WHERE embedding MATCH ? AND k = ?
-			AND rowid IN (
-				SELECT rowid FROM transactions
-				WHERE date >= date('now', ? || ' days')
-			)
-		)
-		SELECT
-			t.date, t.amount, t.payee, t.bank,
-			t.type, t.merchant, t.location, t.details_category, t.description, t.card_number,
-			t.foreign_amount, t.foreign_currency,
-			t.transfer_to_account, t.transfer_from_account, t.transfer_reference,
-			vm.distance
-		FROM vec_matches vm
-		JOIN transactions t ON t.rowid = vm.transaction_id
-		ORDER BY vm.rank_number ASC
-		LIMIT ?
-	`
-
-	rows, err := d.db.QueryContext(ctx, query, embedding, limit, -days, limit)
-	if err != nil {
-		return nil, fmt.Errorf("vector search failed: %w", err)
-	}
-	defer rows.Close()
-
-	var results []types.TransactionSearchResult
-	for rows.Next() {
-		var result types.TransactionSearchResult
-		var t = &result.TransactionWithDetails
-		var date time.Time
-		var amount decimal.Decimal
-		var foreignAmount sql.NullFloat64
-		var foreignCurrency sql.NullString
-		var transferToAccount sql.NullString
-		var transferFromAccount sql.NullString
-		var transferReference sql.NullString
-		var distance float64
-
-		if err := rows.Scan(
-			&date, &amount, &t.Payee, &t.Bank,
-			&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
-			&foreignAmount, &foreignCurrency,
-			&transferToAccount, &transferFromAccount, &transferReference,
-			&distance,
-		); err != nil {
-			return nil, fmt.Errorf("failed to scan transaction: %w", err)
-		}
-
-		// Format date and amount as strings
-		t.Date = date.Format("02/01/2006")
-		t.Amount = amount.String()
-
-		// Set foreign amount if present
-		setForeignAmount(t, foreignAmount, foreignCurrency)
-
-		// Set transfer details if present
-		setTransferDetails(t, transferToAccount, transferFromAccount, transferReference)
-
-		// Set vector score
-		result.Scores.VectorScore = distance
-
-		results = append(results, result)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating vector results: %w", err)
-	}
-
-	return results, nil
-}
-
-// runTextSearch performs a full-text search
-func (d *DB) runTextSearch(ctx context.Context, query string, days int, limit int) ([]types.TransactionSearchResult, error) {
+// SearchTransactionsByText performs a full-text search on transactions
+func (d *DB) SearchTransactionsByText(ctx context.Context, query string, days int, limit int) ([]types.TransactionWithDetails, error) {
 	searchQuery := `
 		SELECT
 			t.date, t.amount, t.payee, t.bank,
 			t.type, t.merchant, t.location, t.details_category, t.description, t.card_number,
 			t.foreign_amount, t.foreign_currency,
-			t.transfer_to_account, t.transfer_from_account, t.transfer_reference,
-			fts.rank
+			t.transfer_to_account, t.transfer_from_account, t.transfer_reference
 		FROM transactions t
 		JOIN transactions_fts fts ON t.rowid = fts.rowid
 		WHERE fts.search_body MATCH ?
 		AND t.date >= date('now', ?)
-		ORDER BY fts.rank DESC
+		ORDER BY rank DESC
 		LIMIT ?
 	`
 
@@ -605,59 +423,20 @@ func (d *DB) runTextSearch(ctx context.Context, query string, days int, limit in
 	}
 	defer rows.Close()
 
-	var results []types.TransactionSearchResult
+	var transactions []types.TransactionWithDetails
 	for rows.Next() {
-		var result types.TransactionSearchResult
-		var t = &result.TransactionWithDetails
-		var date time.Time
-		var amount decimal.Decimal
-		var foreignAmount sql.NullFloat64
-		var foreignCurrency sql.NullString
-		var transferToAccount sql.NullString
-		var transferFromAccount sql.NullString
-		var transferReference sql.NullString
-		var rank float64
-
-		if err := rows.Scan(
-			&date, &amount, &t.Payee, &t.Bank,
-			&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
-			&foreignAmount, &foreignCurrency,
-			&transferToAccount, &transferFromAccount, &transferReference,
-			&rank,
-		); err != nil {
-			return nil, fmt.Errorf("failed to scan transaction: %w", err)
+		var t types.TransactionWithDetails
+		if err := scanTransactionRow(rows, &t); err != nil {
+			return nil, err
 		}
-
-		// Format date and amount as strings
-		t.Date = date.Format("02/01/2006")
-		t.Amount = amount.String()
-
-		// Set foreign amount if present
-		setForeignAmount(t, foreignAmount, foreignCurrency)
-
-		// Set transfer details if present
-		setTransferDetails(t, transferToAccount, transferFromAccount, transferReference)
-
-		// Set text score
-		result.Scores.TextScore = rank
-
-		results = append(results, result)
+		transactions = append(transactions, t)
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating text results: %w", err)
 	}
 
-	return results, nil
-}
-
-// SerializeEmbedding serializes a float32 vector for sqlite-vec
-func (d *DB) SerializeEmbedding(embedding []float32) ([]byte, error) {
-	serialized, err := sqlite_vec.SerializeFloat32(embedding)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize embedding: %w", err)
-	}
-	return serialized, nil
+	return transactions, nil
 }
 
 // DB returns the underlying database connection
@@ -763,38 +542,4 @@ func setTransferDetails(t *types.TransactionWithDetails, toAccount, fromAccount,
 			Reference:   reference.String,
 		}
 	}
-}
-
-// SearchTransactionsByVector searches for transactions using vector similarity
-func (d *DB) SearchTransactionsByVector(ctx context.Context, embedding []byte, days int, limit int) ([]types.TransactionWithDetails, error) {
-	// Use runVectorSearch to get the results
-	results, err := d.runVectorSearch(ctx, embedding, days, limit)
-	if err != nil {
-		return nil, err
-	}
-
-	// Convert to TransactionWithDetails
-	transactions := make([]types.TransactionWithDetails, len(results))
-	for i, result := range results {
-		transactions[i] = result.TransactionWithDetails
-	}
-
-	return transactions, nil
-}
-
-// SearchTransactionsByText performs a full-text search on transactions
-func (d *DB) SearchTransactionsByText(ctx context.Context, query string, days int, limit int) ([]types.TransactionWithDetails, error) {
-	// Use runTextSearch to get the results
-	results, err := d.runTextSearch(ctx, query, days, limit)
-	if err != nil {
-		return nil, err
-	}
-
-	// Convert to TransactionWithDetails
-	transactions := make([]types.TransactionWithDetails, len(results))
-	for i, result := range results {
-		transactions[i] = result.TransactionWithDetails
-	}
-
-	return transactions, nil
 }
