@@ -18,21 +18,23 @@ type Server struct {
 	db       *db.DB
 	analyzer *analyzer.Analyzer
 	logger   *log.Logger
+	banks    []string // List of available banks
 }
 
-func New(db *db.DB, analyzer *analyzer.Analyzer, logger *log.Logger) *Server {
+func New(db *db.DB, analyzer *analyzer.Analyzer, logger *log.Logger, banks []string) *Server {
 	return &Server{
 		db:       db,
 		analyzer: analyzer,
 		logger:   logger,
+		banks:    banks,
 	}
 }
 
 func (s *Server) Run() error {
 	// Create MCP server
 	mcpServer := server.NewMCPServer(
-		"ING Transaction Analyzer",
-		"1.0.0",
+		"Bank Transaction Analyzer",
+		"1.1.0",
 	)
 
 	mcpServer.AddTool(mcp.NewTool("search_transactions",
@@ -47,6 +49,9 @@ func (s *Server) Run() error {
 		),
 		mcp.WithString("limit",
 			mcp.Description("Maximum number of results to return (default: 10)"),
+		),
+		mcp.WithString("bank",
+			mcp.Description("Filter by bank/source (e.g. 'amex', 'ing-australia')"),
 		),
 	), s.searchTransactionsHandler)
 
@@ -65,6 +70,9 @@ func (s *Server) Run() error {
 		mcp.WithString("category",
 			mcp.Description("Filter by transaction category. Use list_categories tool to see available categories."),
 		),
+		mcp.WithString("bank",
+			mcp.Description("Filter by bank/source (e.g. 'amex', 'ing-australia')"),
+		),
 	), s.listTransactionsHandler)
 
 	mcpServer.AddTool(mcp.NewTool("list_categories",
@@ -73,7 +81,14 @@ func (s *Server) Run() error {
 			mcp.Required(),
 			mcp.Description("Number of days to look back"),
 		),
+		mcp.WithString("bank",
+			mcp.Description("Filter by bank/source (e.g. 'amex', 'ing-australia')"),
+		),
 	), s.listCategoriesHandler)
+
+	mcpServer.AddTool(mcp.NewTool("list_banks",
+		mcp.WithDescription("List all available banks/sources for transactions"),
+	), s.listBanksHandler)
 
 	// Start the stdio server
 	if err := server.ServeStdio(mcpServer); err != nil {
@@ -220,6 +235,7 @@ func (s *Server) listTransactionsHandler(ctx context.Context, request mcp.CallTo
 	// Get optional filters
 	txType, _ := request.Params.Arguments["type"].(string)
 	category, _ := request.Params.Arguments["category"].(string)
+	bank, _ := request.Params.Arguments["bank"].(string)
 
 	// First, count total transactions for the period
 	totalCount, err := s.db.CountTransactions(ctx, days)
@@ -233,7 +249,7 @@ func (s *Server) listTransactionsHandler(ctx context.Context, request mcp.CallTo
 		return nil, fmt.Errorf("failed to list transactions: %w", err)
 	}
 
-	// Filter transactions by type and category if specified
+	// Filter transactions by type, category, and bank if specified
 	var filtered []types.TransactionWithDetails
 	for _, t := range transactions {
 		// Skip if type filter is set and doesn't match
@@ -242,6 +258,10 @@ func (s *Server) listTransactionsHandler(ctx context.Context, request mcp.CallTo
 		}
 		// Skip if category filter is set and doesn't match
 		if category != "" && t.Details.Category != category {
+			continue
+		}
+		// Skip if bank filter is set and doesn't match
+		if bank != "" && t.Bank != bank {
 			continue
 		}
 		filtered = append(filtered, t)
@@ -255,14 +275,17 @@ func (s *Server) listTransactionsHandler(ctx context.Context, request mcp.CallTo
 		result += "No transactions found matching your criteria.\n\n"
 	} else {
 		// Determine if we're showing limited results
-		if txType != "" || category != "" {
-			// When filtering by type or category, just show the filtered count
+		if txType != "" || category != "" || bank != "" {
+			// When filtering by type, category, or bank, just show the filtered count
 			result += fmt.Sprintf("Found %d transactions", len(filtered))
 			if txType != "" {
 				result += fmt.Sprintf(" of type '%s'", txType)
 			}
 			if category != "" {
 				result += fmt.Sprintf(" in category '%s'", category)
+			}
+			if bank != "" {
+				result += fmt.Sprintf(" from bank '%s'", bank)
 			}
 			result += ":\n\n"
 		} else if len(filtered) < totalCount {
@@ -332,15 +355,21 @@ func (s *Server) listCategoriesHandler(ctx context.Context, request mcp.CallTool
 		return nil, errors.New("days must be a number or string")
 	}
 
-	// Get categories from database
-	categories, err := s.db.GetCategories(ctx, days)
+	bank, _ := request.Params.Arguments["bank"].(string)
+
+	// Get categories from database, filtered by bank if provided
+	categories, err := s.db.GetCategoriesWithBank(ctx, days, bank)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get categories: %w", err)
 	}
 
 	// Format results
 	var result string
-	result += fmt.Sprintf("Transaction Categories (Last %d days)\n\n", days)
+	result += fmt.Sprintf("Transaction Categories (Last %d days)", days)
+	if bank != "" {
+		result += fmt.Sprintf(" for bank '%s'", bank)
+	}
+	result += "\n\n"
 
 	var totalTransactions int
 	for _, cat := range categories {
@@ -350,5 +379,16 @@ func (s *Server) listCategoriesHandler(ctx context.Context, request mcp.CallTool
 
 	result += fmt.Sprintf("\nTotal Categorized Transactions: %d\n", totalTransactions)
 
+	return mcp.NewToolResultText(result), nil
+}
+
+func (s *Server) listBanksHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if len(s.banks) == 0 {
+		return mcp.NewToolResultText("No banks are registered."), nil
+	}
+	result := "Available Banks:\n\n"
+	for _, bank := range s.banks {
+		result += "- " + bank + "\n"
+	}
 	return mcp.NewToolResultText(result), nil
 }

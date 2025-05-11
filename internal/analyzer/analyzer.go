@@ -6,14 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/avast/retry-go/v4"
 	"github.com/charmbracelet/log"
+	"github.com/lox/bank-transaction-analyzer/internal/agent"
 	"github.com/lox/bank-transaction-analyzer/internal/db"
 	"github.com/lox/bank-transaction-analyzer/internal/types"
-	openrouter "github.com/revrost/go-openrouter"
+	openai "github.com/sashabaranov/go-openai"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -21,10 +22,11 @@ type Config struct {
 	OpenRouterModel string
 	Concurrency     int
 	Progress        bool
+	DryRun          bool
 }
 
 type Analyzer struct {
-	client     *openrouter.Client
+	agent      *agent.Agent
 	logger     *log.Logger
 	db         *db.DB
 	embeddings EmbeddingProvider
@@ -33,14 +35,14 @@ type Analyzer struct {
 
 // NewAnalyzer creates a new transaction analyzer with explicit dependencies
 func NewAnalyzer(
-	client *openrouter.Client,
+	agent *agent.Agent,
 	logger *log.Logger,
 	db *db.DB,
 	embeddingProvider EmbeddingProvider,
 	vectorStorage VectorStorage,
 ) *Analyzer {
 	return &Analyzer{
-		client:     client,
+		agent:      agent,
 		logger:     logger,
 		db:         db,
 		embeddings: embeddingProvider,
@@ -128,18 +130,21 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 				"payee", t.Payee,
 				"duration", time.Since(analysisStart))
 
-			// Store transaction details
-			storeStart := time.Now()
-			if err := a.storeTransaction(gCtx, t, details); err != nil {
-				// If context was canceled, return immediately
-				if errors.Is(err, context.Canceled) {
-					return err
+			// In dry run mode, skip storing transaction and embedding
+			if !config.DryRun {
+				// Store transaction details
+				storeStart := time.Now()
+				if err := a.storeTransaction(gCtx, t, details); err != nil {
+					// If context was canceled, return immediately
+					if errors.Is(err, context.Canceled) {
+						return err
+					}
+					a.logger.Error("Failed to store transaction",
+						"error", err,
+						"payee", t.Payee,
+						"duration", time.Since(storeStart))
+					return fmt.Errorf("error storing transaction: %w", err)
 				}
-				a.logger.Error("Failed to store transaction",
-					"error", err,
-					"payee", t.Payee,
-					"duration", time.Since(storeStart))
-				return fmt.Errorf("error storing transaction: %w", err)
 			}
 
 			// Add to results
@@ -178,6 +183,75 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 	return analyzedTransactions, nil
 }
 
+type transactionType struct {
+	Guideline string
+}
+
+var allowedTypes = map[string]transactionType{
+	"purchase":   {Guideline: "For retail transactions, subscriptions, and general spending"},
+	"transfer":   {Guideline: "For bank transfers, payments to individuals"},
+	"fee":        {Guideline: "For bank fees, account fees, interest charges"},
+	"deposit":    {Guideline: "For money received or added to account"},
+	"withdrawal": {Guideline: "For ATM withdrawals or manual withdrawals"},
+	"refund":     {Guideline: "For refunded purchases or returns"},
+	"interest":   {Guideline: "For interest earned on accounts"},
+	"credit":     {Guideline: "For positive adjustments to your account excluding refunds or interest"},
+	"other":      {Guideline: "For anything that doesn't fit other categories"},
+}
+
+type transactionCategory struct {
+	Guideline string
+}
+
+var allowedCategories = map[string]transactionCategory{
+	"Food & Dining":  {Guideline: "restaurants, cafes, food delivery"},
+	"Shopping":       {Guideline: "retail stores, online shopping"},
+	"Transportation": {Guideline: "Uber, taxis, public transport"},
+	"Entertainment":  {Guideline: "movies, events, festivals"},
+	"Services":       {Guideline: "utilities, subscriptions, professional services"},
+	"Personal Care":  {Guideline: "health, beauty, fitness"},
+	"Travel":         {Guideline: "flights, accommodation, travel services"},
+	"Education":      {Guideline: "courses, books, educational services"},
+	"Home":           {Guideline: "furniture, appliances, home improvement"},
+	"Groceries":      {Guideline: "supermarkets, food stores"},
+	"Bank Fees":      {Guideline: "fees, charges, interest"},
+	"Transfers":      {Guideline: "personal transfers, payments"},
+	"Other":          {Guideline: "anything that doesn't fit other categories"},
+}
+
+func validateTransactionDetails(details *types.TransactionDetails) error {
+	var invalids []string
+	if _, ok := allowedTypes[details.Type]; !ok {
+		invalids = append(invalids, fmt.Sprintf("type='%s'", details.Type))
+	}
+	if _, ok := allowedCategories[details.Category]; !ok {
+		invalids = append(invalids, fmt.Sprintf("category='%s'", details.Category))
+	}
+	if len(invalids) > 0 {
+		return fmt.Errorf("invalid %s. Please use only allowed values", strings.Join(invalids, ", "))
+	}
+	return nil
+}
+
+// Helper to build transaction type guidelines from allowedTypes
+func buildTypeGuidelines() string {
+	var sb strings.Builder
+	for t, info := range allowedTypes {
+		sb.WriteString(fmt.Sprintf("- \"%s\" - %s\n", t, info.Guideline))
+	}
+	return sb.String()
+}
+
+// Helper to build category guidelines from allowedCategories
+func buildCategoryGuidelines() string {
+	var sb strings.Builder
+	sb.WriteString("Use one of these specific categories:\n")
+	for c, info := range allowedCategories {
+		sb.WriteString(fmt.Sprintf("- %s (%s)\n", c, info.Guideline))
+	}
+	return sb.String()
+}
+
 // analyzeTransaction uses an LLM to extract structured information from a transaction
 func (a *Analyzer) analyzeTransaction(ctx context.Context, t types.Transaction, model string) (*types.TransactionDetails, error) {
 	startTime := time.Now()
@@ -187,7 +261,7 @@ func (a *Analyzer) analyzeTransaction(ctx context.Context, t types.Transaction, 
 		"date", t.Date,
 		"model", model)
 
-	prompt := fmt.Sprintf(`Extract and classify transaction details from the following bank transaction.
+	promptBase := fmt.Sprintf(`Extract and classify transaction details from the following bank transaction.
 
 Transaction: %s
 Amount: %s
@@ -198,30 +272,9 @@ Your task is to analyze this transaction and call the classify_transaction funct
 When calling the function, follow these guidelines:
 
 TRANSACTION TYPE GUIDELINES:
-- "purchase" - For retail transactions, subscriptions, and general spending
-- "transfer" - For bank transfers, payments to individuals
-- "fee" - For bank fees, account fees, interest charges
-- "deposit" - For money received or added to account
-- "withdrawal" - For ATM withdrawals or manual withdrawals
-- "refund" - For refunded purchases or returns
-- "interest" - For interest earned on accounts
-
+%s
 CATEGORY GUIDELINES:
-Use one of these specific categories:
-- Food & Dining (restaurants, cafes, food delivery)
-- Shopping (retail stores, online shopping)
-- Transportation (Uber, taxis, public transport)
-- Entertainment (movies, events, festivals)
-- Services (utilities, subscriptions, professional services)
-- Personal Care (health, beauty, fitness)
-- Travel (flights, accommodation, travel services)
-- Education (courses, books, educational services)
-- Home (furniture, appliances, home improvement)
-- Groceries (supermarkets, food stores)
-- Bank Fees (fees, charges, interest)
-- Transfers (personal transfers, payments)
-- Other (anything that doesn't fit above categories)
-
+%s
 DATA CLEANING GUIDELINES:
 1. Remove payment processor details:
    - Remove "SQ *" (Square), "Visa Purchase", "EFTPOS Purchase"
@@ -237,15 +290,23 @@ DATA CLEANING GUIDELINES:
    - For local businesses, use Title Case with appropriate apostrophes
 
 The classify_transaction function requires these fields: type, merchant, category, description, and search_body.`,
-		t.Payee, t.Amount, t.Date)
+		t.Payee, t.Amount, t.Date, buildTypeGuidelines(), buildCategoryGuidelines())
 
-	var details *types.TransactionDetails
+	chatMessages := []openai.ChatCompletionMessage{
+		{
+			Role:    openai.ChatMessageRoleSystem,
+			Content: "You are a financial transaction classifier. You must call the classify_transaction function to extract and structure transaction data. DO NOT explain your reasoning or add comments. ONLY call the function with properly formatted JSON arguments. Follow the exact structure and guidelines provided in the user's prompt.",
+		},
+		{
+			Role:    openai.ChatMessageRoleUser,
+			Content: promptBase,
+		},
+	}
 
-	// Define the parse transaction tool
 	params := map[string]any{
 		"type": map[string]any{
 			"type":        "string",
-			"enum":        []string{"purchase", "transfer", "fee", "deposit", "withdrawal", "refund", "interest"},
+			"enum":        []string{"purchase", "transfer", "fee", "deposit", "withdrawal", "refund", "interest", "credit"},
 			"description": "The type of transaction",
 		},
 		"merchant": map[string]any{
@@ -306,92 +367,48 @@ The classify_transaction function requires these fields: type, merchant, categor
 			"description": "Additional details for transfer transactions",
 		},
 	}
-
-	// Add required fields to params
 	params["required"] = []string{"type", "merchant", "category", "description", "search_body"}
 
-	f := openrouter.FunctionDefinition{
+	f := openai.FunctionDefinition{
 		Name:        "classify_transaction",
 		Description: "Classify and extract details from bank transaction data",
 		Parameters:  params,
 		Strict:      true,
 	}
 
-	parseTransactionTool := openrouter.Tool{
-		Type:     openrouter.ToolTypeFunction,
+	parseTransactionTool := openai.Tool{
+		Type:     openai.ToolTypeFunction,
 		Function: &f,
 	}
 
-	// Retry the API call with exponential backoff
-	err := retry.Do(
-		func() error {
-			resp, err := a.client.CreateChatCompletion(
-				ctx,
-				openrouter.ChatCompletionRequest{
-					Model: model,
-					Messages: []openrouter.ChatCompletionMessage{
-						{
-							Role:    openrouter.ChatMessageRoleSystem,
-							Content: openrouter.Content{Text: "You are a financial transaction classifier. You must call the classify_transaction function to extract and structure transaction data. DO NOT explain your reasoning or add comments. ONLY call the function with properly formatted JSON arguments. Follow the exact structure and guidelines provided in the user's prompt."},
-						},
-						{
-							Role:    openrouter.ChatMessageRoleUser,
-							Content: openrouter.Content{Text: prompt},
-						},
-					},
-					MaxCompletionTokens: 1000,
-					Temperature:         0.1,
-					Tools:               []openrouter.Tool{parseTransactionTool},
-				},
-			)
-			if err != nil {
-				return retry.Unrecoverable(err)
-			}
-
-			// Validate response
-			if len(resp.Choices) == 0 {
-				return retry.Unrecoverable(fmt.Errorf("no choices in response"))
-			}
-
-			// Check if the response contains tool calls
-			message := resp.Choices[0].Message
-			if len(message.ToolCalls) == 0 {
-				return fmt.Errorf("no tool calls in response")
-			}
-
-			// Get the first tool call
-			toolCall := message.ToolCalls[0]
-			if toolCall.Function.Name != "classify_transaction" {
-				return fmt.Errorf("unexpected tool call: %s", toolCall.Function.Name)
-			}
-
-			// Parse the arguments
-			var parsedDetails types.TransactionDetails
-			if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &parsedDetails); err != nil {
-				a.logger.Warn("Invalid JSON in tool call arguments",
-					"error", err,
-					"arguments", toolCall.Function.Arguments)
-				return fmt.Errorf("invalid JSON in tool call arguments: %w", err)
-			}
-
-			details = &parsedDetails
-			return nil
-		},
-		retry.Context(ctx),
-		retry.Attempts(3),
-		retry.DelayType(retry.BackOffDelay),
-		retry.OnRetry(func(n uint, err error) {
-			a.logger.Warn("Retrying API call",
-				"attempt", n+1,
-				"max_attempts", 3,
+	validator := func(toolCall openai.ToolCall) (interface{}, error) {
+		if toolCall.Function.Name != "classify_transaction" {
+			return nil, fmt.Errorf("unexpected tool call: %s", toolCall.Function.Name)
+		}
+		var parsedDetails types.TransactionDetails
+		if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &parsedDetails); err != nil {
+			a.logger.Warn("Invalid JSON in tool call arguments",
 				"error", err,
-				"payee", t.Payee)
-		}),
-	)
-
-	if err != nil {
-		return nil, fmt.Errorf("error getting completion: %w", err)
+				"arguments", toolCall.Function.Arguments)
+			return nil, fmt.Errorf("invalid JSON in tool call arguments: %w", err)
+		}
+		if err := validateTransactionDetails(&parsedDetails); err != nil {
+			return nil, err
+		}
+		return &parsedDetails, nil
 	}
+
+	result, err := a.agent.RunLoop(
+		ctx,
+		chatMessages,
+		[]openai.Tool{parseTransactionTool},
+		validator,
+		3,
+	)
+	if err != nil {
+		return nil, err
+	}
+	details := result.(*types.TransactionDetails)
 
 	a.logger.Debug("Successfully parsed transaction details",
 		"payee", t.Payee,
@@ -449,20 +466,20 @@ func (a *Analyzer) UpdateEmbedding(ctx context.Context, tx *types.TransactionWit
 	// Generate transaction ID
 	txID := db.GenerateTransactionID(tx.Transaction)
 
-	// // Check if embedding exists in vector storage with content hash
-	// exists, err := a.vectors.HasEmbedding(ctx, txID, tx.Details.SearchBody)
-	// if err != nil {
-	// 	return false, fmt.Errorf("failed to check embedding existence: %w", err)
-	// }
+	// Check if embedding exists in vector storage with content hash
+	exists, err := a.vectors.HasEmbedding(ctx, txID, tx.Details.SearchBody)
+	if err != nil {
+		return false, fmt.Errorf("failed to check embedding existence: %w", err)
+	}
 
-	// // If embedding already exists and is up to date, nothing to do
-	// if exists {
-	// 	a.logger.Debug("Embedding already exists and is up to date",
-	// 		"id", txID,
-	// 		"payee", tx.Payee,
-	// 		"merchant", tx.Details.Merchant)
-	// 	return false, nil
-	// }
+	// If embedding already exists and is up to date, nothing to do
+	if exists {
+		a.logger.Debug("Embedding already exists and is up to date",
+			"id", txID,
+			"payee", tx.Payee,
+			"merchant", tx.Details.Merchant)
+		return false, nil
+	}
 
 	// Generate embedding
 	embedding, err := a.embeddings.GenerateEmbedding(ctx, tx.Details.SearchBody)

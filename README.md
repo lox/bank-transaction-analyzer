@@ -26,6 +26,12 @@ A powerful tool for analyzing bank transactions using language models via OpenRo
   - Optimized database indexes
   - Efficient search algorithms
 
+
+## Banks Supported
+
+- ING Australia
+- American Express
+
 ## Installation
 
 ### Prerequisites
@@ -68,7 +74,7 @@ After activating Hermit, the following commands are available in your PATH:
    ```json
    {
      "mcpServers": {
-       "ing-transactions": {
+       "bank-transactions": {
          "command": "bank-mcp-server"
        }
      }

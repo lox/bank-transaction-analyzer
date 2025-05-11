@@ -566,6 +566,44 @@ func (d *DB) GetCategories(ctx context.Context, days int) ([]CategoryCount, erro
 	return categories, nil
 }
 
+// GetCategoriesWithBank returns all unique categories and their counts from the last N days, optionally filtered by bank
+func (d *DB) GetCategoriesWithBank(ctx context.Context, days int, bank string) ([]CategoryCount, error) {
+	if bank == "" {
+		return d.GetCategories(ctx, days)
+	}
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT
+			details_category as category,
+			COUNT(*) as count
+		FROM transactions
+		WHERE date >= date('now', ? || ' days')
+		AND bank = ?
+		AND details_category IS NOT NULL
+		AND details_category != ''
+		GROUP BY details_category
+		ORDER BY count DESC, category ASC
+	`, -days, bank)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query categories: %w", err)
+	}
+	defer rows.Close()
+
+	var categories []CategoryCount
+	for rows.Next() {
+		var cat CategoryCount
+		if err := rows.Scan(&cat.Category, &cat.Count); err != nil {
+			return nil, fmt.Errorf("failed to scan category row: %w", err)
+		}
+		categories = append(categories, cat)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating categories: %w", err)
+	}
+
+	return categories, nil
+}
+
 // scanTransactionRow scans a transaction row into a TransactionWithDetails struct
 func scanTransactionRow(rows *sql.Rows, t *types.TransactionWithDetails) error {
 	var date time.Time

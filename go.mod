@@ -13,9 +13,10 @@ require (
 	github.com/ncruces/go-sqlite3 v0.25.1
 	github.com/philippgille/chromem-go v0.7.0
 	github.com/revrost/go-openrouter v0.0.0-20250414052218-c9123df8a97e
+	github.com/sashabaranov/go-openai v1.39.1
 	github.com/schollz/progressbar/v3 v3.14.2
 	github.com/shopspring/decimal v1.4.0
-	golang.org/x/sync v0.13.0
+	golang.org/x/sync v0.14.0
 	google.golang.org/api v0.231.0
 )
 
@@ -53,7 +54,7 @@ require (
 	go.opentelemetry.io/otel/metric v1.35.0 // indirect
 	go.opentelemetry.io/otel/trace v1.35.0 // indirect
 	golang.org/x/crypto v0.37.0 // indirect
-	golang.org/x/exp v0.0.0-20231006140011-7918f672742d // indirect
+	golang.org/x/exp v0.0.0-20250506013437-ce4c2cf36ca6 // indirect
 	golang.org/x/net v0.39.0 // indirect
 	golang.org/x/oauth2 v0.29.0 // indirect
 	golang.org/x/sys v0.32.0 // indirect

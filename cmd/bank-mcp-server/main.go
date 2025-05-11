@@ -9,6 +9,9 @@ import (
 
 	"github.com/charmbracelet/log"
 	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
+	"github.com/lox/bank-transaction-analyzer/internal/bank"
+	"github.com/lox/bank-transaction-analyzer/internal/bank/amex"
+	"github.com/lox/bank-transaction-analyzer/internal/bank/ing"
 	"github.com/lox/bank-transaction-analyzer/internal/commands"
 	"github.com/lox/bank-transaction-analyzer/internal/db"
 	"github.com/lox/bank-transaction-analyzer/internal/mcp"
@@ -75,8 +78,13 @@ func main() {
 	// Initialize analyzer
 	txAnalyzer := analyzer.NewAnalyzer(nil, logger, database, embeddingProvider, vectorStorage)
 
+	// Initialize bank registry and register banks
+	bankRegistry := bank.NewRegistry()
+	bankRegistry.Register(ing.New())
+	bankRegistry.Register(amex.New())
+
 	logger.Info("Starting MCP server")
-	s := mcp.New(database, txAnalyzer, logger)
+	s := mcp.New(database, txAnalyzer, logger, bankRegistry.List())
 	if err := s.Run(); err != nil {
 		panic(err)
 	}
