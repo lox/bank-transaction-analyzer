@@ -825,12 +825,6 @@ func (a *Analyzer) HybridSearch(
 	// Sort results by RRF score (highest first)
 	sortSearchResultsByRRFScore(finalResults)
 
-	// Calculate the total count - use the larger of text and vector search totals
-	totalCount := textTotalCount
-	if vectorResults.TotalCount > totalCount {
-		totalCount = vectorResults.TotalCount
-	}
-
 	// Return full results set before limiting for total count
 	allResultsCount := len(finalResults)
 
