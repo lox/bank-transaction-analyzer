@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 
-	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
 	"github.com/lox/bank-transaction-analyzer/internal/bank"
 	"github.com/lox/bank-transaction-analyzer/internal/qif"
 	"github.com/lox/bank-transaction-analyzer/internal/types"
@@ -45,9 +44,15 @@ func (i *ING) ParseTransactions(ctx context.Context, r io.Reader) ([]types.Trans
 	return transactions, nil
 }
 
-// ProcessTransactions processes transactions using the analyzer
-func (i *ING) ProcessTransactions(ctx context.Context, transactions []types.Transaction, an *analyzer.Analyzer, config analyzer.Config) ([]types.TransactionWithDetails, error) {
-	return an.AnalyzeTransactions(ctx, transactions, config)
+// AdditionalPromptRules returns ING-specific rules for prompt injection
+func (i *ING) AdditionalPromptRules() string {
+	return `
+- For ING transfer transactions, the full BSB and account number after 'To' (e.g., 'To 033134 452177') should be extracted as the to_account field, formatted as '033134 452177'.
+- Never use the receipt number as a reference unless it appears after 'Ref' or 'Reference'.
+- If both BSB and account are present, combine them as 'BSB ACCOUNT' (e.g., '033134 452177').
+- Ignore repeated or duplicated transaction text in the payee field.
+- Do not use the receipt number as the to_account or reference unless explicitly indicated.
+`
 }
 
 // Ensure ING implements the Bank interface

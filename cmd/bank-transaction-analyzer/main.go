@@ -23,15 +23,15 @@ type CLI struct {
 	commands.CommonConfig
 	commands.EmbeddingConfig
 
-	OpenRouterKey    string `help:"OpenRouter API key" env:"OPENROUTER_API_KEY" required:""`
-	OpenRouterModel  string `help:"OpenRouter model to use for analysis" default:"google/gemini-2.5-flash-preview" env:"OPENROUTER_MODEL"`
-	Concurrency      int    `help:"Number of concurrent operations to process" default:"10"`
-	NoProgress       bool   `help:"Disable progress bar" default:"false"`
-	Bank             string `help:"Bank to use for processing" default:"ing-australia" enum:"ing-australia,amex"`
-	QIFFile          string `help:"Path to QIF file to process" required:""`
-	UpdateEmbeddings bool   `help:"Update embeddings for all transactions after processing" default:"false"`
-	DryRun           bool   `help:"Print parsed transactions and exit (no analysis)" default:"false"`
-	Limit            int    `help:"Limit the number of transactions to process (0 = no limit)" default:"0"`
+	OpenRouterKey   string `help:"OpenRouter API key" env:"OPENROUTER_API_KEY" required:""`
+	OpenRouterModel string `help:"OpenRouter model to use for analysis" default:"google/gemini-2.5-flash-preview" env:"OPENROUTER_MODEL"`
+	Concurrency     int    `help:"Number of concurrent operations to process" default:"10"`
+	NoProgress      bool   `help:"Disable progress bar" default:"false"`
+	Bank            string `help:"Bank to use for processing" default:"ing-australia" enum:"ing-australia,amex"`
+	QIFFile         string `help:"Path to QIF file to process" required:""`
+	DryRun          bool   `help:"Print parsed transactions and exit (no analysis)" default:"false"`
+	Limit           int    `help:"Limit the number of transactions to process (0 = no limit)" default:"0"`
+	Print           bool   `help:"Print classified transactions after processing (does not skip analysis/storage)" default:"false"`
 }
 
 func (c *CLI) Run() error {
@@ -88,11 +88,6 @@ func (c *CLI) Run() error {
 		logger.Fatal("Failed to parse transactions", "error", err)
 	}
 
-	// Apply limit if set
-	if c.Limit > 0 && len(transactions) > c.Limit {
-		transactions = transactions[:c.Limit]
-	}
-
 	// Initialize embedding provider and vector storage
 	an, err := initAnalyzer(processCtx, c, agentInst, database, logger)
 	if err != nil {
@@ -100,59 +95,29 @@ func (c *CLI) Run() error {
 	}
 
 	// Process transactions
-	analyzedTransactions, err := bankImpl.ProcessTransactions(processCtx, transactions, an, analyzer.Config{
+	analyzedTransactions, err := an.AnalyzeTransactions(processCtx, transactions, analyzer.Config{
 		OpenRouterModel: c.OpenRouterModel,
 		Concurrency:     c.Concurrency,
 		Progress:        !c.NoProgress,
 		DryRun:          c.DryRun,
-	})
+		Limit:           c.Limit,
+	}, bankImpl)
 	if err != nil {
 		logger.Fatal("Failed to process transactions", "error", err)
 	}
 
 	if c.DryRun {
 		logger.Info("Dry run: displaying analyzed transactions", "count", len(analyzedTransactions))
-		for i, t := range analyzedTransactions {
-			if i >= c.Limit && c.Limit > 0 {
-				break
-			}
-			b, err := json.MarshalIndent(t, "", "  ")
-			if err != nil {
-				fmt.Printf("Error marshaling transaction: %v\n", err)
-				continue
-			}
-			fmt.Println(string(b))
-		}
+		printTransactions(analyzedTransactions, c.Limit)
 		return nil
 	}
 
-	logger.Info("Transactions processed successfully", "count", len(analyzedTransactions))
-
-	// Update embeddings if requested
-	if c.UpdateEmbeddings {
-		transactionsNeedingUpdate := make([]types.TransactionWithDetails, 0)
-		for _, t := range analyzedTransactions {
-			hasEmbedding, err := an.HasTransactionEmbedding(processCtx, &t)
-			if err != nil {
-				logger.Fatal("Failed to check if transaction embedding exists", "error", err)
-				return err
-			}
-			if !hasEmbedding {
-				transactionsNeedingUpdate = append(transactionsNeedingUpdate, t)
-			}
-		}
-		logger.Info("Updating embeddings for transactions without embeddings", "count", len(transactionsNeedingUpdate))
-		err = an.UpdateEmbeddings(processCtx, transactionsNeedingUpdate, analyzer.Config{
-			Concurrency: c.Concurrency,
-			Progress:    !c.NoProgress,
-		})
-		if err != nil {
-			logger.Fatal("Failed to update embeddings", "error", err)
-			return err
-		}
-
-		logger.Info("Embeddings updated successfully")
+	if c.Print {
+		logger.Info("Printing classified transactions", "count", len(analyzedTransactions))
+		printTransactions(analyzedTransactions, c.Limit)
 	}
+
+	logger.Info("Transactions processed successfully", "count", len(analyzedTransactions))
 
 	return nil
 }
@@ -160,15 +125,7 @@ func (c *CLI) Run() error {
 // Initialize the analyzer with the embedding provider and vector storage
 func initAnalyzer(ctx context.Context, config *CLI, agentInst *agent.Agent, database *db.DB, logger *log.Logger) (*analyzer.Analyzer, error) {
 	// Initialize embedding provider using the common setup
-	embeddingOptions := commands.EmbeddingOptions{
-		Provider:      config.Provider,
-		LlamaCppModel: config.LlamaCppModel,
-		GeminiAPIKey:  config.GeminiAPIKey,
-		// For Gemini, we can use the OpenRouterModel as the GeminiModel if desired
-		Logger: logger,
-	}
-
-	embeddingProvider, err := commands.SetupEmbeddingProvider(ctx, embeddingOptions)
+	embeddingProvider, err := commands.SetupEmbeddingProvider(ctx, config.EmbeddingConfig, logger)
 	if err != nil {
 		logger.Fatal("Failed to initialize embedding provider", "error", err)
 		return nil, err
@@ -183,6 +140,22 @@ func initAnalyzer(ctx context.Context, config *CLI, agentInst *agent.Agent, data
 
 	// Create analyzer with all the required dependencies
 	return analyzer.NewAnalyzer(agentInst, logger, database, embeddingProvider, vectorStorage), nil
+}
+
+// printTransactions prints the analyzed transactions up to the limit (if set)
+func printTransactions(transactions []types.TransactionWithDetails, limit int) {
+	count := len(transactions)
+	if limit > 0 && count > limit {
+		count = limit
+	}
+	for i := 0; i < count; i++ {
+		b, err := json.MarshalIndent(transactions[i], "", "  ")
+		if err != nil {
+			fmt.Printf("Error marshaling transaction: %v\n", err)
+			continue
+		}
+		fmt.Println(string(b))
+	}
 }
 
 func main() {

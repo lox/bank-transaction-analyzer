@@ -12,7 +12,9 @@ import (
 
 	"github.com/charmbracelet/log"
 	"github.com/lox/bank-transaction-analyzer/internal/agent"
+	"github.com/lox/bank-transaction-analyzer/internal/bank"
 	"github.com/lox/bank-transaction-analyzer/internal/db"
+	"github.com/lox/bank-transaction-analyzer/internal/embeddings"
 	"github.com/lox/bank-transaction-analyzer/internal/types"
 	openai "github.com/sashabaranov/go-openai"
 	"golang.org/x/sync/errgroup"
@@ -23,14 +25,15 @@ type Config struct {
 	Concurrency     int
 	Progress        bool
 	DryRun          bool
+	Limit           int
 }
 
 type Analyzer struct {
 	agent      *agent.Agent
 	logger     *log.Logger
 	db         *db.DB
-	embeddings EmbeddingProvider
-	vectors    VectorStorage
+	embeddings embeddings.EmbeddingProvider
+	vectors    embeddings.VectorStorage
 }
 
 // NewAnalyzer creates a new transaction analyzer with explicit dependencies
@@ -38,8 +41,8 @@ func NewAnalyzer(
 	agent *agent.Agent,
 	logger *log.Logger,
 	db *db.DB,
-	embeddingProvider EmbeddingProvider,
-	vectorStorage VectorStorage,
+	embeddingProvider embeddings.EmbeddingProvider,
+	vectorStorage embeddings.VectorStorage,
 ) *Analyzer {
 	return &Analyzer{
 		agent:      agent,
@@ -50,13 +53,8 @@ func NewAnalyzer(
 	}
 }
 
-// DB returns the database connection
-func (a *Analyzer) DB() *db.DB {
-	return a.db
-}
-
-// AnalyzeTransactions processes transactions in parallel and stores their details
-func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types.Transaction, config Config) ([]types.TransactionWithDetails, error) {
+// AnalyzeTransactions processes and returns only newly analyzed transactions (not already in the database)
+func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types.Transaction, config Config, bank bank.Bank) ([]types.TransactionWithDetails, error) {
 	startTime := time.Now()
 	a.logger.Info("Starting transaction analysis", "total_transactions", len(transactions))
 
@@ -65,6 +63,10 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 	filteredTransactions, err := a.db.FilterExistingTransactions(ctx, transactions)
 	if err != nil {
 		return nil, fmt.Errorf("error filtering existing transactions: %w", err)
+	}
+	// Apply limit after filtering
+	if config.Limit > 0 && len(filteredTransactions) > config.Limit {
+		filteredTransactions = filteredTransactions[:config.Limit]
 	}
 	a.logger.Debug("Filtered existing transactions",
 		"duration", time.Since(filterStart),
@@ -79,26 +81,8 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 		progress = NewBarProgress(len(filteredTransactions))
 	}
 
-	// Initialize result slice with capacity for all transactions
-	analyzedTransactions := make([]types.TransactionWithDetails, 0, len(transactions))
-
-	// First, get all existing transactions
-	for _, t := range transactions {
-		exists, err := a.db.Has(ctx, t)
-		if err != nil {
-			return nil, fmt.Errorf("error checking if transaction exists: %w", err)
-		}
-		if exists {
-			analyzed, err := a.db.Get(ctx, t)
-			if err != nil {
-				return nil, fmt.Errorf("error getting transaction details: %w", err)
-			}
-			analyzedTransactions = append(analyzedTransactions, types.TransactionWithDetails{
-				Transaction: t,
-				Details:     *analyzed,
-			})
-		}
-	}
+	// Initialize result slice with capacity for all newly processed transactions
+	analyzedTransactions := make([]types.TransactionWithDetails, 0, len(filteredTransactions))
 
 	// Process new transactions in parallel
 	g, gCtx := errgroup.WithContext(ctx)
@@ -114,7 +98,7 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 
 			// Parse transaction details
 			analysisStart := time.Now()
-			details, err := a.analyzeTransaction(gCtx, t, config.OpenRouterModel)
+			details, err := a.analyzeTransaction(gCtx, t, config.OpenRouterModel, bank)
 			if err != nil {
 				// If context was canceled, return immediately
 				if errors.Is(err, context.Canceled) {
@@ -183,77 +167,82 @@ func (a *Analyzer) AnalyzeTransactions(ctx context.Context, transactions []types
 	return analyzedTransactions, nil
 }
 
-type transactionType struct {
-	Guideline string
-}
-
-var allowedTypes = map[string]transactionType{
-	"purchase":   {Guideline: "For retail transactions, subscriptions, and general spending"},
-	"transfer":   {Guideline: "For bank transfers, payments to individuals"},
-	"fee":        {Guideline: "For bank fees, account fees, interest charges"},
-	"deposit":    {Guideline: "For money received or added to account"},
-	"withdrawal": {Guideline: "For ATM withdrawals or manual withdrawals"},
-	"refund":     {Guideline: "For refunded purchases or returns"},
-	"interest":   {Guideline: "For interest earned on accounts"},
-	"credit":     {Guideline: "For positive adjustments to your account excluding refunds or interest"},
-	"other":      {Guideline: "For anything that doesn't fit other categories"},
-}
-
-type transactionCategory struct {
-	Guideline string
-}
-
-var allowedCategories = map[string]transactionCategory{
-	"Food & Dining":  {Guideline: "restaurants, cafes, food delivery"},
-	"Shopping":       {Guideline: "retail stores, online shopping"},
-	"Transportation": {Guideline: "Uber, taxis, public transport"},
-	"Entertainment":  {Guideline: "movies, events, festivals"},
-	"Services":       {Guideline: "utilities, subscriptions, professional services"},
-	"Personal Care":  {Guideline: "health, beauty, fitness"},
-	"Travel":         {Guideline: "flights, accommodation, travel services"},
-	"Education":      {Guideline: "courses, books, educational services"},
-	"Home":           {Guideline: "furniture, appliances, home improvement"},
-	"Groceries":      {Guideline: "supermarkets, food stores"},
-	"Bank Fees":      {Guideline: "fees, charges, interest"},
-	"Transfers":      {Guideline: "personal transfers, payments"},
-	"Other":          {Guideline: "anything that doesn't fit other categories"},
-}
-
 func validateTransactionDetails(details *types.TransactionDetails) error {
 	var invalids []string
-	if _, ok := allowedTypes[details.Type]; !ok {
+	if _, ok := types.AllowedTypesMap[details.Type]; !ok {
 		invalids = append(invalids, fmt.Sprintf("type='%s'", details.Type))
 	}
-	if _, ok := allowedCategories[details.Category]; !ok {
+	if _, ok := types.AllowedCategoriesMap[details.Category]; !ok {
 		invalids = append(invalids, fmt.Sprintf("category='%s'", details.Category))
 	}
+
+	// Check if foreign amount has a valid currency code (3 letters)
+	if details.ForeignAmount != nil {
+		currency := details.ForeignAmount.Currency
+		if len(currency) != 3 || !isValidCurrencyCode(currency) {
+			invalids = append(invalids, fmt.Sprintf("foreign_amount.currency='%s'", currency))
+		}
+	}
+
 	if len(invalids) > 0 {
 		return fmt.Errorf("invalid %s. Please use only allowed values", strings.Join(invalids, ", "))
 	}
 	return nil
 }
 
-// Helper to build transaction type guidelines from allowedTypes
+// isValidCurrencyCode checks if a string is a valid ISO 4217 currency code
+// This is a simple validation that checks if the string is 3 uppercase letters
+func isValidCurrencyCode(code string) bool {
+	if len(code) != 3 {
+		return false
+	}
+	for _, c := range code {
+		if c < 'A' || c > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+// Helper to extract names from TransactionType slice
+func getTypeNames(types []types.TransactionType) []string {
+	names := make([]string, len(types))
+	for i, t := range types {
+		names[i] = t.Name
+	}
+	return names
+}
+
+// Helper to extract names from TransactionCategory slice
+func getCategoryNames(categories []types.TransactionCategory) []string {
+	names := make([]string, len(categories))
+	for i, c := range categories {
+		names[i] = c.Name
+	}
+	return names
+}
+
+// Helper to build transaction type guidelines from AllowedTypes
 func buildTypeGuidelines() string {
 	var sb strings.Builder
-	for t, info := range allowedTypes {
-		sb.WriteString(fmt.Sprintf("- \"%s\" - %s\n", t, info.Guideline))
+	for _, t := range types.AllowedTypes {
+		sb.WriteString(fmt.Sprintf("- \"%s\" - %s\n", t.Name, t.Guideline))
 	}
 	return sb.String()
 }
 
-// Helper to build category guidelines from allowedCategories
+// Helper to build category guidelines from AllowedCategories
 func buildCategoryGuidelines() string {
 	var sb strings.Builder
 	sb.WriteString("Use one of these specific categories:\n")
-	for c, info := range allowedCategories {
-		sb.WriteString(fmt.Sprintf("- %s (%s)\n", c, info.Guideline))
+	for _, c := range types.AllowedCategories {
+		sb.WriteString(fmt.Sprintf("- %s (%s)\n", c.Name, c.Guideline))
 	}
 	return sb.String()
 }
 
 // analyzeTransaction uses an LLM to extract structured information from a transaction
-func (a *Analyzer) analyzeTransaction(ctx context.Context, t types.Transaction, model string) (*types.TransactionDetails, error) {
+func (a *Analyzer) analyzeTransaction(ctx context.Context, t types.Transaction, model string, bank bank.Bank) (*types.TransactionDetails, error) {
 	startTime := time.Now()
 	a.logger.Debug("Analyzing transaction",
 		"payee", t.Payee,
@@ -267,30 +256,157 @@ Transaction: %s
 Amount: %s
 Date: %s
 
+BANK-SPECIFIC RULES:
+%s
+
 Your task is to analyze this transaction and call the classify_transaction function with structured data.
 
 When calling the function, follow these guidelines:
 
-TRANSACTION TYPE GUIDELINES:
-%s
-CATEGORY GUIDELINES:
-%s
-DATA CLEANING GUIDELINES:
-1. Remove payment processor details:
-   - Remove "SQ *" (Square), "Visa Purchase", "EFTPOS Purchase"
+IMPORTANT RULES:
+1. Remove payment processor prefixes and suffixes:
+   - Remove "SQ *" (Square)
+   - Remove "Visa Purchase", "EFTPOS Purchase"
    - Remove "Receipt" and receipt numbers
    - Remove "Date", "Time" and timestamps
-   - Remove "Card" and card numbers unless needed in card_number field
-2. For foreign amounts:
-   - Extract amount as a number (e.g., 11.99, not "$11.99")
-   - Extract 3-letter currency code (e.g., USD, EUR)
-3. Format merchant names properly:
-   - Remove domains (.com, .net)
-   - Use proper capitalization (e.g., "McDonald's", not "MCDONALDS")
-   - For local businesses, use Title Case with appropriate apostrophes
+   - Remove "Card" and card numbers unless storing in card_number field
+2. Extract location even if it's at the end of the merchant name
+3. Clean merchant names:
+   - Remove any domain names (e.g., .com, .co)
+   - Remove any help/support text
+   - Use the main brand name only
+   - Use proper case formatting (e.g., "Richie's Cafe" not "RICHIES CAFE")
+   - For chains, use their official capitalization (e.g., "McDonald's" not "MCDONALDS")
+   - For local businesses, use title case with appropriate apostrophes
+4. For foreign amounts:
+   - Carefully extract all foreign amount and currency information
+   - If you see "Foreign Currency Amount: USD 11.99", extract amount=11.99 and currency=USD
+   - Amount MUST be a valid number (integer or decimal), not a string or object
+   - The amount should be just the number value without currency symbols or formatting
+   - Currency must be the 3-letter currency code (USD, EUR, GBP, etc.)
+   - Example: For "Foreign amount USD 29.99", use {"amount": 29.99, "currency": "USD"}
+   - NEVER return an empty object {} for foreign_amount
+   - If a foreign currency amount is present but the currency code is missing or invalid, do not return a foreign_amount object.
+5. Special handling for food delivery services:
+   - For Uber Eats, use "Uber Eats" as merchant name
+   - For DoorDash, use "DoorDash" as merchant name
+   - For Menulog, use "Menulog" as merchant name
+   - Category should be "Food & Dining" for all food delivery services
+6. Description field rules:
+   - NEVER include the amount in the description
+   - Provide a brief description of what was purchased
+   - For restaurants/cafes, describe the type of food or service
+   - For retail, describe the type of items purchased
+   - For services, describe the service provided
+   - Keep descriptions concise but informative
+7. Card number extraction:
+   - If a card number is present in the format "Card XXXX...XXXX", extract it
+   - Store the full card number in the card_number field
+   - Do not mask or truncate the card number
+8. Transfer details processing:
+   - For transfer transactions, carefully extract account numbers, removing any non-essential characters
+   - The to_account field should only contain the account number, not dates, amounts, or transaction details
+   - For reference fields, keep only the actual reference text, not dates or amounts
+   - Never include the full transaction details in the transfer_details fields
+   - Ignore any narrative text that describes the transaction
+9. Search body generation:
+   - Generate a search_body field that contains all relevant keywords from the transaction
+   - Include the merchant name, location, description, and any other relevant details
+   - Use proper case formatting for the search_body
+10. Transaction type classification:
+%s
+11. Transaction category classification:
+%s
+
+EXAMPLES:
+
+Example 1 - Purchase:
+Transaction: EFTPOS PURCHASE AMAZON.COM.AU SYDNEY AU ON 12 MAR Card 1234...5678
+Amount: -49.95
+Date: 2023-03-12
+
+Correct response:
+{
+  "type": "purchase",
+  "merchant": "Amazon",
+  "location": "Sydney AU",
+  "category": "Shopping",
+  "description": "Online retail purchase",
+  "card_number": "1234...5678",
+  "search_body": "Amazon Sydney AU Online retail purchase"
+}
+
+Example 2 - Transfer:
+Transaction: Transfer to Nicole Smith BSB 062-692 Account 87654321 Reference: BIRTHDAY GIFT
+Amount: -100.00
+Date: 2023-04-15
+
+Correct response:
+{
+  "type": "transfer",
+  "merchant": "Nicole Smith",
+  "category": "Transfers",
+  "description": "Personal transfer",
+  "search_body": "Nicole Smith Personal transfer Birthday gift",
+  "transfer_details": {
+    "to_account": "87654321",
+    "reference": "BIRTHDAY GIFT"
+  }
+}
+
+Example 3 - Foreign Purchase:
+Transaction: UBER TRIP 1234ABCD SAN FRANCISCO USA Foreign Currency Amount USD 11.99
+Amount: -18.52
+Date: 2023-05-22
+
+Correct response:
+{
+  "type": "purchase",
+  "merchant": "Uber",
+  "location": "San Francisco USA",
+  "category": "Transportation",
+  "description": "Ride service",
+  "search_body": "Uber San Francisco USA Ride service",
+  "foreign_amount": {
+    "amount": 11.99,
+    "currency": "USD"
+  }
+}
+
+Example 4 - Food Delivery:
+Transaction: DOORDASH *MARIOS PIZZA MELBOURNE
+Amount: -32.50
+Date: 2023-06-10
+
+Correct response:
+{
+  "type": "purchase",
+  "merchant": "DoorDash",
+  "location": "Melbourne",
+  "category": "Food & Dining",
+  "description": "Food delivery from Mario's Pizza",
+  "search_body": "DoorDash Melbourne Food delivery Mario's Pizza"
+}
+
+Example 5 - BPAY Payment:
+Transaction: BPAY PAYMENT-THANK YOU REC # 0000775466
+Amount: -7900.77
+Date: 2023-06-15
+
+Correct response:
+{
+  "type": "transfer",
+  "merchant": "BPAY",
+  "category": "Services",
+  "description": "BPAY bill payment",
+  "search_body": "BPAY bill payment",
+  "transfer_details": {
+    "reference": "0000775466"
+  }
+}
 
 The classify_transaction function requires these fields: type, merchant, category, description, and search_body.`,
-		t.Payee, t.Amount, t.Date, buildTypeGuidelines(), buildCategoryGuidelines())
+		t.Payee, t.Amount, t.Date, bank.AdditionalPromptRules(), buildTypeGuidelines(), buildCategoryGuidelines())
 
 	chatMessages := []openai.ChatCompletionMessage{
 		{
@@ -306,7 +422,7 @@ The classify_transaction function requires these fields: type, merchant, categor
 	params := map[string]any{
 		"type": map[string]any{
 			"type":        "string",
-			"enum":        []string{"purchase", "transfer", "fee", "deposit", "withdrawal", "refund", "interest", "credit"},
+			"enum":        getTypeNames(types.AllowedTypes),
 			"description": "The type of transaction",
 		},
 		"merchant": map[string]any{
@@ -320,6 +436,7 @@ The classify_transaction function requires these fields: type, merchant, categor
 		"category": map[string]any{
 			"type":        "string",
 			"description": "The spending category of the transaction",
+			"enum":        getCategoryNames(types.AllowedCategories),
 		},
 		"description": map[string]any{
 			"type":        "string",
@@ -392,10 +509,21 @@ The classify_transaction function requires these fields: type, merchant, categor
 				"arguments", toolCall.Function.Arguments)
 			return nil, fmt.Errorf("invalid JSON in tool call arguments: %w", err)
 		}
+		// Default type and category to 'other' if empty
+		if parsedDetails.Type == "" {
+			parsedDetails.Type = types.TransactionTypeOther
+		}
+		if parsedDetails.Category == "" {
+			parsedDetails.Category = types.TransactionCategoryOther
+		}
 		if err := validateTransactionDetails(&parsedDetails); err != nil {
 			return nil, err
 		}
 		return &parsedDetails, nil
+	}
+
+	shouldStop := func(toolCall openai.ToolCall) bool {
+		return toolCall.Function.Name == "classify_transaction"
 	}
 
 	result, err := a.agent.RunLoop(
@@ -403,6 +531,7 @@ The classify_transaction function requires these fields: type, merchant, categor
 		chatMessages,
 		[]openai.Tool{parseTransactionTool},
 		validator,
+		shouldStop,
 		3,
 	)
 	if err != nil {
@@ -458,13 +587,17 @@ func (a *Analyzer) HasTransactionEmbedding(ctx context.Context, tx *types.Transa
 // UpdateEmbedding updates the embedding for a single transaction
 // Returns true if the embedding was created/updated, false if it was already up to date
 func (a *Analyzer) UpdateEmbedding(ctx context.Context, tx *types.TransactionWithDetails) (bool, error) {
-	// If the search body is empty, nothing to do
-	if tx.Details.SearchBody == "" {
-		return false, nil
-	}
-
 	// Generate transaction ID
 	txID := db.GenerateTransactionID(tx.Transaction)
+
+	// If the search body is empty, nothing to do
+	if tx.Details.SearchBody == "" {
+		a.logger.Warn("Search body is empty, skipping embedding update",
+			"id", txID,
+			"payee", tx.Payee,
+			"merchant", tx.Details.Merchant)
+		return false, nil
+	}
 
 	// Check if embedding exists in vector storage with content hash
 	exists, err := a.vectors.HasEmbedding(ctx, txID, tx.Details.SearchBody)
@@ -479,6 +612,11 @@ func (a *Analyzer) UpdateEmbedding(ctx context.Context, tx *types.TransactionWit
 			"payee", tx.Payee,
 			"merchant", tx.Details.Merchant)
 		return false, nil
+	} else {
+		a.logger.Debug("Embedding does not exist, generating and storing",
+			"id", txID,
+			"payee", tx.Payee,
+			"merchant", tx.Details.Merchant)
 	}
 
 	// Generate embedding
@@ -501,46 +639,47 @@ func (a *Analyzer) UpdateEmbedding(ctx context.Context, tx *types.TransactionWit
 	return true, nil
 }
 
-// UpdateEmbeddings updates embeddings for the provided transactions
-func (a *Analyzer) UpdateEmbeddings(ctx context.Context, transactions []types.TransactionWithDetails, config Config) error {
-	if len(transactions) == 0 {
-		return nil
-	}
-
-	a.logger.Info("Updating embeddings for provided transactions", "count", len(transactions))
+// UpdateAllEmbeddings updates embeddings for all transactions in the database
+func (a *Analyzer) UpdateAllEmbeddings(ctx context.Context, config Config) error {
+	a.logger.Info("Updating embeddings for all transactions in the database (iterator mode)")
 	startTime := time.Now()
 
-	// Set up progress tracking
-	var progress Progress
-	if !config.Progress {
-		progress = NewNoopProgress()
-	} else {
-		progress = NewBarProgress(len(transactions))
+	// Count total transactions for progress bar
+	totalCount, err := a.db.Count()
+	if err != nil {
+		a.logger.Warn("Failed to count transactions for progress bar", "error", err)
+		totalCount = 0 // fallback: no progress bar
 	}
 
-	// Track the number of updated transactions
-	var updateCount int32
+	var progress Progress
+	if !config.Progress || totalCount == 0 {
+		progress = NewNoopProgress()
+	} else {
+		progress = NewBarProgress(totalCount)
+	}
 
-	// Process each transaction one by one
-	for _, tx := range transactions {
-		// Check if context is canceled
+	var updateCount int32
+	it := a.db.IterateTransactions(ctx)
+	for {
+		tx, ok := it.Next()
+		if !ok {
+			break
+		}
+
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		// Update embedding for this transaction
-		updated, err := a.UpdateEmbedding(ctx, &tx)
+		updated, err := a.UpdateEmbedding(ctx, tx)
 		if err != nil {
 			a.logger.Warn("Failed to update embedding",
 				"error", err,
 				"payee", tx.Payee)
 			// Continue with other transactions
 		} else if updated {
-			// Increment update counter if embedding was updated
 			atomic.AddInt32(&updateCount, 1)
 		}
 
-		// Update progress
 		if err := progress.Add(1); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err
@@ -549,8 +688,8 @@ func (a *Analyzer) UpdateEmbeddings(ctx context.Context, transactions []types.Tr
 		}
 	}
 
-	a.logger.Info("Completed embedding update for provided transactions",
-		"total_processed", len(transactions),
+	a.logger.Info("Completed embedding update for all transactions",
+		"total_processed", totalCount,
 		"total_updated", updateCount,
 		"duration", time.Since(startTime))
 

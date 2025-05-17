@@ -5,77 +5,105 @@ import (
 	"fmt"
 
 	"github.com/charmbracelet/log"
-	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
+	"github.com/lox/bank-transaction-analyzer/internal/embeddings"
 )
 
-// EmbeddingOptions contains runtime configuration for embedding providers
-type EmbeddingOptions struct {
-	// Provider is the name of the embedding provider to use (llamacpp or gemini)
-	Provider string
-	// LlamaCppModel is the name of the specific LLaMA.cpp model to use
-	LlamaCppModel string
-	// GeminiAPIKey is the API key for Gemini
-	GeminiAPIKey string
-	// GeminiModel is the name of the Gemini model to use
-	GeminiModel string
-	// Logger is used for logging embedding operations
-	Logger *log.Logger
-}
-
 // SetupEmbeddingProvider initializes and returns an embedding provider based on the config
-func SetupEmbeddingProvider(ctx context.Context, options EmbeddingOptions) (analyzer.EmbeddingProvider, error) {
-	var embeddingProvider analyzer.EmbeddingProvider
+func SetupEmbeddingProvider(ctx context.Context, config EmbeddingConfig, logger *log.Logger) (embeddings.EmbeddingProvider, error) {
+	var embeddingProvider embeddings.EmbeddingProvider
 	var err error
 
-	switch options.Provider {
+	switch config.Provider {
 	case "gemini":
-		if options.GeminiAPIKey == "" {
+		if config.GeminiAPIKey == "" {
 			return nil, fmt.Errorf("gemini api key is required when using Gemini embeddings")
 		}
 
 		// Create Gemini embedding provider config
-		geminiConfig := analyzer.NewGeminiConfig().
-			WithAPIKey(options.GeminiAPIKey).
-			WithLogger(options.Logger)
+		geminiConfig := embeddings.NewGeminiConfig().
+			WithAPIKey(config.GeminiAPIKey).
+			WithLogger(logger)
 
 		// Set custom model name if provided
-		if options.GeminiModel != "" {
-			geminiConfig = geminiConfig.WithModelName(options.GeminiModel)
+		if config.GeminiModel != "" {
+			geminiConfig = geminiConfig.WithModelName(config.GeminiModel)
 		}
 
-		embeddingProvider, err = analyzer.NewGeminiEmbeddingProvider(ctx, geminiConfig)
+		embeddingProvider, err = embeddings.NewGeminiEmbeddingProvider(ctx, geminiConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Gemini embedding provider: %w", err)
 		}
 
-		options.Logger.Info("Using Gemini API for embeddings", "model", geminiConfig.ModelName)
+		logger.Info("Using Gemini API for embeddings", "model", geminiConfig.ModelName)
 
 	case "llamacpp":
-		if options.LlamaCppModel == "" {
+		if config.LlamaCppModel == "" {
 			return nil, fmt.Errorf("llamacpp model name is required when using LlamaCpp embeddings")
 		}
 
-		// Create LlamaCpp embedding provider
-		llamaCppConfig := analyzer.NewLlamaCppConfig().
-			WithLogger(options.Logger).
-			WithModelName(options.LlamaCppModel)
+		llamaCppConfig := embeddings.NewLlamaCppConfig().
+			WithLogger(logger).
+			WithModelName(config.LlamaCppModel)
+		if config.LlamaCppURL != "" {
+			llamaCppConfig = llamaCppConfig.WithURL(config.LlamaCppURL)
+		}
 
-		embeddingProvider, err = analyzer.NewLlamaCppEmbeddingProvider(llamaCppConfig)
+		embeddingProvider, err = embeddings.NewLlamaCppEmbeddingProvider(llamaCppConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create LlamaCpp embedding provider: %w", err)
 		}
 
-		options.Logger.Info("Using LlamaCpp for embeddings", "model", llamaCppConfig.ModelName)
+		logger.Info("Using LlamaCpp for embeddings", "model", llamaCppConfig.ModelName, "url", llamaCppConfig.URL)
+
+	case "lmstudio":
+		// LMStudio exposes an OpenAI-compatible API, so use the OpenAI provider with the LMStudio endpoint
+		embeddingProvider, err = embeddings.NewOpenAIEmbeddingProvider(embeddings.NewOpenAIConfig().
+			WithAPIKey("dummy").
+			WithModelName(config.LMStudioModel).
+			WithLogger(logger).
+			WithEndpoint(config.LMStudioEndpoint))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create LMStudio (OpenAI-compatible) embedding provider: %w", err)
+		}
+		logger.Info("Using LMStudio (OpenAI-compatible) for embeddings", "model", config.LMStudioModel, "endpoint", config.LMStudioEndpoint)
+
+	case "ollama":
+		embeddingProvider, err = embeddings.NewOpenAIEmbeddingProvider(embeddings.NewOpenAIConfig().
+			WithAPIKey("dummy").
+			WithModelName(config.OllamaModel).
+			WithLogger(logger).
+			WithEndpoint(config.OllamaEndpoint))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Ollama embedding provider: %w", err)
+		}
+		logger.Info("Using Ollama for embeddings", "model", config.OllamaModel, "endpoint", config.OllamaEndpoint)
+
+	case "openai":
+		if config.OpenAIAPIKey == "" {
+			return nil, fmt.Errorf("openai api key is required when using OpenAI embeddings")
+		}
+		openaiConfig := embeddings.NewOpenAIConfig().
+			WithAPIKey(config.OpenAIAPIKey).
+			WithModelName(config.OpenAIModel).
+			WithLogger(logger)
+		if config.OpenAIEndpoint != "" {
+			openaiConfig = openaiConfig.WithEndpoint(config.OpenAIEndpoint)
+		}
+		embeddingProvider, err = embeddings.NewOpenAIEmbeddingProvider(openaiConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create OpenAI embedding provider: %w", err)
+		}
+		logger.Info("Using OpenAI-compatible API for embeddings", "model", openaiConfig.ModelName, "endpoint", openaiConfig.Endpoint)
 
 	default:
-		return nil, fmt.Errorf("unknown embedding provider: %s", options.Provider)
+		return nil, fmt.Errorf("unknown embedding provider: %s", config.Provider)
 	}
 
 	return embeddingProvider, nil
 }
 
 // CloseEmbeddingProvider attempts to close the embedding provider if it implements Close
-func CloseEmbeddingProvider(provider analyzer.EmbeddingProvider, logger *log.Logger) {
+func CloseEmbeddingProvider(provider embeddings.EmbeddingProvider, logger *log.Logger) {
 	if closer, ok := provider.(interface{ Close() error }); ok {
 		if err := closer.Close(); err != nil {
 			logger.Warn("Failed to close embedding provider", "error", err)

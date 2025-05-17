@@ -173,16 +173,17 @@ CREATE TABLE transactions (
 
 The tool supports multiple embedding providers:
 
-1. **Local llama.cpp Server**
-   - Default provider for local embedding generation
-   - Runs a local server with:
-   ```bash
-   build/bin/llama-server -m models/snowflake-arctic-embed-m-v1.5.d70deb40.f16.gguf --embeddings -c 768 -ngl 0
-   ```
-   - Uses the Snowflake Arctic Embed v1.5 model
-   - Generates 768-dimensional embeddings
-   - Runs on CPU (ngl 0)
-   - Optimized for embedding generation
+1. **Local via LMStudio (Recommended)**
+   - Preferred provider for local embedding generation
+   - Use [LMStudio](https://lmstudio.ai/) to run a local llama.cpp server
+   - Download the [tensorblock/gte-Qwen2-7B-instruct-GGUF](https://huggingface.co/tensorblock/gte-Qwen2-7B-instruct-GGUF) model (recommended for high-quality embeddings)
+   - In LMStudio, add the model and start the server with embedding support enabled
+   - Example LMStudio server command:
+     ```bash
+     lmstudio --server --model /path/to/gte-Qwen2-7B-instruct.Q4_K_M.gguf --embeddings
+     ```
+   - Generates high-quality embeddings suitable for semantic search
+   - Runs efficiently on modern CPUs/GPUs
 
 2. **Google Gemini API**
    - High-quality embeddings using Google's Gemini embedding model

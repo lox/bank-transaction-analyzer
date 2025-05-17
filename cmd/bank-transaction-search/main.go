@@ -12,6 +12,7 @@ import (
 	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
 	"github.com/lox/bank-transaction-analyzer/internal/commands"
 	"github.com/lox/bank-transaction-analyzer/internal/db"
+	"github.com/lox/bank-transaction-analyzer/internal/embeddings"
 	"github.com/lox/bank-transaction-analyzer/internal/types"
 )
 
@@ -91,16 +92,8 @@ func (c *CLI) setupCommonComponents() (*log.Logger, *time.Location, *db.DB, erro
 }
 
 // setupVectorComponents initializes the embedding provider, vector storage, and analyzer
-func (c *CLI) setupVectorComponents(ctx context.Context, logger *log.Logger, database *db.DB) (analyzer.EmbeddingProvider, analyzer.VectorStorage, *analyzer.Analyzer, error) {
-	// Initialize embedding provider
-	embeddingOptions := commands.EmbeddingOptions{
-		Provider:      c.Provider,
-		LlamaCppModel: c.LlamaCppModel,
-		GeminiAPIKey:  c.GeminiAPIKey,
-		Logger:        logger,
-	}
-
-	embeddingProvider, err := commands.SetupEmbeddingProvider(ctx, embeddingOptions)
+func (c *CLI) setupVectorComponents(ctx context.Context, logger *log.Logger, database *db.DB) (embeddings.EmbeddingProvider, embeddings.VectorStorage, *analyzer.Analyzer, error) {
+	embeddingProvider, err := commands.SetupEmbeddingProvider(ctx, c.EmbeddingConfig, logger)
 	if err != nil {
 		logger.Fatal("Failed to initialize embedding provider", "error", err)
 		return nil, nil, nil, err

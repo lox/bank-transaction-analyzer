@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/ncruces/go-sqlite3/driver"
@@ -42,7 +43,9 @@ CREATE TABLE IF NOT EXISTS transactions (
 	-- Transfer details
 	transfer_to_account TEXT,
 	transfer_from_account TEXT,
-	transfer_reference TEXT
+	transfer_reference TEXT,
+	-- Tags (comma-separated)
+	tags TEXT
 );
 
 -- Create virtual table for full-text search
@@ -74,6 +77,10 @@ CREATE INDEX IF NOT EXISTS idx_transactions_merchant ON transactions(merchant);
 CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(details_category);
 CREATE INDEX IF NOT EXISTS idx_transactions_amount ON transactions(amount);
 CREATE INDEX IF NOT EXISTS idx_transactions_bank ON transactions(bank);
+
+CREATE TABLE IF NOT EXISTS migrations (
+    id INTEGER PRIMARY KEY
+);
 `
 
 // DB represents a SQLite database connection
@@ -142,6 +149,13 @@ func (d *DB) Init(ctx context.Context) error {
 		if _, err := d.db.ExecContext(ctx, schema); err != nil {
 			return fmt.Errorf("failed to create database schema: %v", err)
 		}
+		// Mark all migrations as applied
+		for _, m := range migrations {
+			_, err := d.db.ExecContext(ctx, `INSERT INTO migrations (id) VALUES (?)`, m.ID)
+			if err != nil {
+				return fmt.Errorf("failed to mark migration %d as applied: %v", m.ID, err)
+			}
+		}
 	} else {
 		// Apply migrations if database already exists
 		if err := ApplyMigrations(ctx, d.db, func(msg string, args ...interface{}) {
@@ -172,13 +186,15 @@ func (d *DB) Store(ctx context.Context, t types.Transaction, details *types.Tran
 			id, date, amount, payee, bank,
 			type, merchant, location, details_category, description, card_number, search_body,
 			foreign_amount, foreign_currency,
-			transfer_to_account, transfer_from_account, transfer_reference
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			transfer_to_account, transfer_from_account, transfer_reference,
+			tags
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		id, date, t.Amount, t.Payee, t.Bank,
 		details.Type, details.Merchant, details.Location, details.Category, details.Description, details.CardNumber, details.SearchBody,
 		getForeignAmount(details), getForeignCurrency(details),
 		getTransferToAccount(details), getTransferFromAccount(details), getTransferReference(details),
+		details.Tags,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to store transaction: %v", err)
@@ -220,10 +236,7 @@ func (d *DB) Get(ctx context.Context, t types.Transaction) (*types.TransactionDe
 
 	// Set foreign amount if present
 	if foreignAmount.Valid && foreignCurrency.Valid {
-		details.ForeignAmount = &struct {
-			Amount   decimal.Decimal `json:"amount"`
-			Currency string          `json:"currency"`
-		}{
+		details.ForeignAmount = &types.ForeignAmountDetails{
 			Amount:   decimal.NewFromFloat(foreignAmount.Float64),
 			Currency: foreignCurrency.String,
 		}
@@ -231,11 +244,7 @@ func (d *DB) Get(ctx context.Context, t types.Transaction) (*types.TransactionDe
 
 	// Set transfer details if present
 	if transferToAccount.Valid || transferFromAccount.Valid || transferReference.Valid {
-		details.TransferDetails = &struct {
-			ToAccount   string `json:"to_account,omitempty"`
-			FromAccount string `json:"from_account,omitempty"`
-			Reference   string `json:"reference,omitempty"`
-		}{
+		details.TransferDetails = &types.TransferDetails{
 			ToAccount:   transferToAccount.String,
 			FromAccount: transferFromAccount.String,
 			Reference:   transferReference.String,
@@ -387,28 +396,162 @@ func (d *DB) GetTransactionByID(ctx context.Context, id string) (*types.Transact
 	return &t, nil
 }
 
+// GetTransactionsOptions defines options for filtering and paginating transactions
+type GetTransactionsOptions struct {
+	Days         int
+	Limit        int
+	Offset       int
+	Category     string
+	Type         string
+	Bank         string
+	MinAmount    string
+	MaxAmount    string
+	AbsMinAmount string // For absolute value filtering
+	AbsMaxAmount string // For absolute value filtering
+}
+
+// GetTransactionsOption is a function that modifies GetTransactionsOptions
+type GetTransactionsOption func(*GetTransactionsOptions)
+
+// FilterByDays sets the number of days to look back
+func FilterByDays(days int) GetTransactionsOption {
+	return func(opts *GetTransactionsOptions) {
+		opts.Days = days
+	}
+}
+
+// FilterByCategory sets the category filter
+func FilterByCategory(category string) GetTransactionsOption {
+	return func(opts *GetTransactionsOptions) {
+		opts.Category = category
+	}
+}
+
+// FilterByType sets the type filter
+func FilterByType(txType string) GetTransactionsOption {
+	return func(opts *GetTransactionsOptions) {
+		opts.Type = txType
+	}
+}
+
+// FilterByBank sets the bank filter
+func FilterByBank(bank string) GetTransactionsOption {
+	return func(opts *GetTransactionsOptions) {
+		opts.Bank = bank
+	}
+}
+
+// FilterByAmount sets both minimum and maximum amount filters
+func FilterByAmount(minAmount, maxAmount string) GetTransactionsOption {
+	return func(opts *GetTransactionsOptions) {
+		opts.MinAmount = minAmount
+		opts.MaxAmount = maxAmount
+	}
+}
+
+// FilterByAbsoluteAmount sets min and max filters using absolute values
+func FilterByAbsoluteAmount(minAmount, maxAmount string) GetTransactionsOption {
+	return func(opts *GetTransactionsOptions) {
+		opts.AbsMinAmount = minAmount
+		opts.AbsMaxAmount = maxAmount
+	}
+}
+
+// WithLimit sets the limit
+func WithLimit(limit int) GetTransactionsOption {
+	return func(opts *GetTransactionsOptions) {
+		opts.Limit = limit
+	}
+}
+
+// WithOffset sets the offset
+func WithOffset(offset int) GetTransactionsOption {
+	return func(opts *GetTransactionsOptions) {
+		opts.Offset = offset
+	}
+}
+
 // GetTransactions returns transactions with details from the last N days
-// with optional limit and offset for pagination
-func (d *DB) GetTransactions(ctx context.Context, days int, limit int, offset int) ([]types.TransactionWithDetails, error) {
+// with optional limit, offset, and filters for category, type, and bank
+func (d *DB) GetTransactions(ctx context.Context, options ...GetTransactionsOption) ([]types.TransactionWithDetails, error) {
+	// Set defaults
+	opts := GetTransactionsOptions{
+		Days:   30,
+		Limit:  50,
+		Offset: 0,
+	}
+	for _, opt := range options {
+		opt(&opts)
+	}
+
 	query := `
 		SELECT t.date, t.amount, t.payee, t.bank,
 			t.type, t.merchant, t.location, t.details_category, t.description, t.card_number,
+			t.search_body,
 			t.foreign_amount, t.foreign_currency,
 			t.transfer_to_account, t.transfer_from_account, t.transfer_reference
 		FROM transactions t
 		WHERE t.date >= date('now', ? || ' days')
-		ORDER BY t.date DESC
 	`
+	params := []interface{}{-opts.Days}
+
+	if opts.Category != "" {
+		query += " AND t.details_category = ?"
+		params = append(params, opts.Category)
+	}
+	if opts.Type != "" {
+		query += " AND t.type = ?"
+		params = append(params, opts.Type)
+	}
+	if opts.Bank != "" {
+		query += " AND t.bank = ?"
+		params = append(params, opts.Bank)
+	}
+
+	// Handle absolute value filtering
+	if opts.AbsMinAmount != "" && opts.AbsMaxAmount != "" {
+		// When min and max are the same, it's an exact amount search
+		if opts.AbsMinAmount == opts.AbsMaxAmount {
+			query += " AND (t.amount = ? OR t.amount = -?)"
+			params = append(params, opts.AbsMinAmount, opts.AbsMinAmount)
+		} else {
+			// Range search: amount >= min OR amount <= -min, AND amount <= max AND amount >= -max
+			query += " AND (t.amount >= ? OR t.amount <= -?)"
+			query += " AND (t.amount <= ? AND t.amount >= -?)"
+			params = append(params, opts.AbsMinAmount, opts.AbsMinAmount, opts.AbsMaxAmount, opts.AbsMaxAmount)
+		}
+	} else if opts.AbsMinAmount != "" {
+		query += " AND (t.amount >= ? OR t.amount <= -?)"
+		params = append(params, opts.AbsMinAmount, opts.AbsMinAmount)
+	} else if opts.AbsMaxAmount != "" {
+		query += " AND (t.amount <= ? AND t.amount >= -?)"
+		params = append(params, opts.AbsMaxAmount, opts.AbsMaxAmount)
+	} else if opts.MinAmount != "" && opts.MaxAmount != "" {
+		// Original amount filtering (non-absolute)
+		query += " AND t.amount BETWEEN ? AND ?"
+		params = append(params, opts.MinAmount, opts.MaxAmount)
+	} else if opts.MinAmount != "" {
+		query += " AND t.amount >= ?"
+		params = append(params, opts.MinAmount)
+	} else if opts.MaxAmount != "" {
+		query += " AND t.amount <= ?"
+		params = append(params, opts.MaxAmount)
+	}
+
+	query += " ORDER BY t.date DESC"
 
 	// Add limit and offset if provided
-	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
-		if offset > 0 {
-			query += fmt.Sprintf(" OFFSET %d", offset)
+	if opts.Limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", opts.Limit)
+		if opts.Offset > 0 {
+			query += fmt.Sprintf(" OFFSET %d", opts.Offset)
 		}
 	}
 
-	rows, err := d.db.QueryContext(ctx, query, -days)
+	// Log the SQL query with parameters for debugging
+	d.logger.Debug("Executing SQL query", "query", query, "params", params)
+
+	rows, err := d.db.QueryContext(ctx, query, params...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query transactions: %w", err)
 	}
@@ -608,6 +751,7 @@ func (d *DB) GetCategoriesWithBank(ctx context.Context, days int, bank string) (
 func scanTransactionRow(rows *sql.Rows, t *types.TransactionWithDetails) error {
 	var date time.Time
 	var amount decimal.Decimal
+	var searchBody string
 	var foreignAmount sql.NullFloat64
 	var foreignCurrency sql.NullString
 	var transferToAccount sql.NullString
@@ -617,6 +761,7 @@ func scanTransactionRow(rows *sql.Rows, t *types.TransactionWithDetails) error {
 	if err := rows.Scan(
 		&date, &amount, &t.Payee, &t.Bank,
 		&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
+		&searchBody,
 		&foreignAmount, &foreignCurrency,
 		&transferToAccount, &transferFromAccount, &transferReference,
 	); err != nil {
@@ -626,6 +771,7 @@ func scanTransactionRow(rows *sql.Rows, t *types.TransactionWithDetails) error {
 	// Format date and amount as strings
 	t.Date = date.Format("02/01/2006")
 	t.Amount = amount.String()
+	t.Details.SearchBody = searchBody
 
 	// Set foreign amount if present
 	setForeignAmount(t, foreignAmount, foreignCurrency)
@@ -639,10 +785,7 @@ func scanTransactionRow(rows *sql.Rows, t *types.TransactionWithDetails) error {
 // setForeignAmount sets the foreign amount details on a transaction if present
 func setForeignAmount(t *types.TransactionWithDetails, amount sql.NullFloat64, currency sql.NullString) {
 	if amount.Valid && currency.Valid {
-		t.Details.ForeignAmount = &struct {
-			Amount   decimal.Decimal `json:"amount"`
-			Currency string          `json:"currency"`
-		}{
+		t.Details.ForeignAmount = &types.ForeignAmountDetails{
 			Amount:   decimal.NewFromFloat(amount.Float64),
 			Currency: currency.String,
 		}
@@ -652,11 +795,7 @@ func setForeignAmount(t *types.TransactionWithDetails, amount sql.NullFloat64, c
 // setTransferDetails sets the transfer details on a transaction if present
 func setTransferDetails(t *types.TransactionWithDetails, toAccount, fromAccount, reference sql.NullString) {
 	if toAccount.Valid || fromAccount.Valid || reference.Valid {
-		t.Details.TransferDetails = &struct {
-			ToAccount   string `json:"to_account,omitempty"`
-			FromAccount string `json:"from_account,omitempty"`
-			Reference   string `json:"reference,omitempty"`
-		}{
+		t.Details.TransferDetails = &types.TransferDetails{
 			ToAccount:   toAccount.String,
 			FromAccount: fromAccount.String,
 			Reference:   reference.String,
@@ -676,4 +815,74 @@ func (d *DB) CountTransactions(ctx context.Context, days int) (int, error) {
 	}
 
 	return count, nil
+}
+
+// UpdateTransaction updates merchant, type, details_category, and tags for a transaction by ID
+func (d *DB) UpdateTransaction(ctx context.Context, id string, merchant, txType, category, tags *string) error {
+	query := "UPDATE transactions SET "
+	params := []interface{}{}
+	set := []string{}
+	if merchant != nil {
+		set = append(set, "merchant = ?")
+		params = append(params, *merchant)
+	}
+	if txType != nil {
+		set = append(set, "type = ?")
+		params = append(params, *txType)
+	}
+	if category != nil {
+		set = append(set, "details_category = ?")
+		params = append(params, *category)
+	}
+	if tags != nil {
+		set = append(set, "tags = ?")
+		params = append(params, *tags)
+	}
+	if len(set) == 0 {
+		return fmt.Errorf("no fields to update")
+	}
+	query += strings.Join(set, ", ") + " WHERE id = ?"
+	params = append(params, id)
+	_, err := d.db.ExecContext(ctx, query, params...)
+	if err != nil {
+		return fmt.Errorf("failed to update transaction: %w", err)
+	}
+	return nil
+}
+
+type TransactionIterator struct {
+	rows *sql.Rows
+	err  error
+}
+
+func (d *DB) IterateTransactions(ctx context.Context) *TransactionIterator {
+	query := `
+		SELECT t.date, t.amount, t.payee, t.bank,
+			t.type, t.merchant, t.location, t.details_category, t.description, t.card_number,
+			t.search_body,
+			t.foreign_amount, t.foreign_currency,
+			t.transfer_to_account, t.transfer_from_account, t.transfer_reference
+		FROM transactions t
+		ORDER BY t.date DESC
+	`
+	rows, err := d.db.QueryContext(ctx, query)
+	if err != nil {
+		// You may want to handle this differently, e.g., panic or return a special iterator
+		panic(err)
+	}
+	return &TransactionIterator{rows: rows}
+}
+
+// Go 1.23 iterator protocol
+func (it *TransactionIterator) Next() (*types.TransactionWithDetails, bool) {
+	if !it.rows.Next() {
+		it.rows.Close()
+		return nil, false
+	}
+	var t types.TransactionWithDetails
+	if err := scanTransactionRow(it.rows, &t); err != nil {
+		it.err = err
+		return nil, false
+	}
+	return &t, true
 }

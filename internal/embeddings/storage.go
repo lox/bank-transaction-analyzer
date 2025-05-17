@@ -1,4 +1,4 @@
-package analyzer
+package embeddings
 
 import (
 	"context"
@@ -179,6 +179,15 @@ func (s *ChromemStorage) HasEmbedding(ctx context.Context, id string, content st
 
 	// Check model name
 	storedModelName := metadata["model_name"]
+
+	// Debug log for comparison
+	s.logger.Debug("Embedding comparison",
+		"id", id,
+		"stored_model_name", storedModelName,
+		"current_model_name", s.modelName,
+		"stored_hash", storedHash,
+		"new_hash", newContentHash,
+	)
 
 	// Compare the hashes
 	matches := storedHash == newContentHash && storedModelName == s.modelName

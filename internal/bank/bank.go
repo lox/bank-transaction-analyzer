@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 
-	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
 	"github.com/lox/bank-transaction-analyzer/internal/types"
 )
 
@@ -16,8 +15,8 @@ type Bank interface {
 	// ParseTransactions parses transactions from a QIF file
 	ParseTransactions(ctx context.Context, r io.Reader) ([]types.Transaction, error)
 
-	// ProcessTransactions processes transactions using the analyzer
-	ProcessTransactions(ctx context.Context, transactions []types.Transaction, an *analyzer.Analyzer, config analyzer.Config) ([]types.TransactionWithDetails, error)
+	// AdditionalPromptRules returns bank-specific rules for prompt injection
+	AdditionalPromptRules() string
 }
 
 // Registry maintains a list of available bank implementations

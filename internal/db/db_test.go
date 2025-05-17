@@ -368,7 +368,7 @@ func TestGetTransactionsWithPagination(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			transactions, err := db.GetTransactions(ctx, 30, tc.limit, tc.offset)
+			transactions, err := db.GetTransactions(ctx, FilterByDays(30), WithLimit(tc.limit), WithOffset(tc.offset))
 			if err != nil {
 				t.Fatalf("Failed to get transactions: %v", err)
 			}
@@ -397,6 +397,126 @@ func TestGetTransactionsWithPagination(t *testing.T) {
 				if transactions[0].Details.Merchant != fmt.Sprintf("Store %d", expectedStartId) {
 					t.Errorf("Expected first record to be Store %d, got %s",
 						expectedStartId, transactions[0].Details.Merchant)
+				}
+			}
+		})
+	}
+}
+
+func TestFilterByAbsoluteAmount(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert test transactions with both positive and negative amounts
+	testTransactions := []struct {
+		amount string
+		payee  string
+	}{
+		{"100.00", "Positive 100"},
+		{"-100.00", "Negative 100"},
+		{"50.00", "Positive 50"},
+		{"-50.00", "Negative 50"},
+		{"150.00", "Positive 150"},
+		{"-150.00", "Negative 150"},
+	}
+
+	for i, tt := range testTransactions {
+		// Use current date for all transactions
+		date := time.Now().Format("02/01/2006")
+		transaction := types.Transaction{
+			Date:   date,
+			Amount: tt.amount,
+			Payee:  tt.payee,
+			Bank:   "Test Bank",
+		}
+
+		details := &types.TransactionDetails{
+			Type:        "purchase",
+			Merchant:    tt.payee,
+			Description: fmt.Sprintf("Test transaction %d", i),
+			SearchBody:  tt.payee,
+		}
+
+		if err := db.Store(ctx, transaction, details); err != nil {
+			t.Fatalf("failed to store transaction: %v", err)
+		}
+	}
+
+	// Print all transactions to verify they were stored correctly
+	allTransactions, err := db.GetTransactions(ctx, FilterByDays(30))
+	if err != nil {
+		t.Fatalf("Failed to get all transactions: %v", err)
+	}
+	t.Logf("Total transactions stored: %d", len(allTransactions))
+	for i, tx := range allTransactions {
+		t.Logf("Transaction %d: %s %s", i, tx.Amount, tx.Payee)
+	}
+
+	// Directly query the database to see how amounts are stored
+	rows, err := db.DB().QueryContext(ctx, "SELECT payee, amount, typeof(amount) FROM transactions")
+	if err != nil {
+		t.Fatalf("Failed to query transactions: %v", err)
+	}
+	defer rows.Close()
+
+	t.Log("Database storage information:")
+	for rows.Next() {
+		var payee, amount, typeofAmount string
+		if err := rows.Scan(&payee, &amount, &typeofAmount); err != nil {
+			t.Fatalf("Failed to scan row: %v", err)
+		}
+		t.Logf("Payee: %s, Amount: %s, Type: %s", payee, amount, typeofAmount)
+	}
+
+	// Test absolute value filtering
+	testCases := []struct {
+		name      string
+		minAmount string
+		maxAmount string
+		expected  int // expected number of results
+	}{
+		{
+			name:      "Filter by min amount 100",
+			minAmount: "100",
+			maxAmount: "",
+			expected:  4, // Should get all ±100 and ±150
+		},
+		{
+			name:      "Filter by max amount 100",
+			minAmount: "",
+			maxAmount: "100",
+			expected:  4, // Should get all ±50 and ±100
+		},
+		{
+			name:      "Filter by range 50-100",
+			minAmount: "50",
+			maxAmount: "100",
+			expected:  4, // Should get all ±50 and ±100
+		},
+		{
+			name:      "Filter by exact amount 50",
+			minAmount: "50",
+			maxAmount: "50",
+			expected:  2, // Should get both +50 and -50
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			transactions, err := db.GetTransactions(ctx,
+				FilterByDays(30),
+				FilterByAbsoluteAmount(tc.minAmount, tc.maxAmount),
+			)
+			if err != nil {
+				t.Fatalf("Failed to get transactions: %v", err)
+			}
+
+			if len(transactions) != tc.expected {
+				t.Errorf("Expected %d transactions, got %d", tc.expected, len(transactions))
+				for i, tx := range transactions {
+					t.Logf("Result %d: %s %s", i, tx.Amount, tx.Payee)
 				}
 			}
 		})

@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"github.com/charmbracelet/log"
 	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
 	"github.com/lox/bank-transaction-analyzer/internal/bank"
@@ -16,14 +17,6 @@ import (
 	"github.com/lox/bank-transaction-analyzer/internal/db"
 	"github.com/lox/bank-transaction-analyzer/internal/mcp"
 )
-
-func getEnv(key string, defaultValue string) string {
-	value := os.Getenv(key)
-	if value == "" {
-		return defaultValue
-	}
-	return value
-}
 
 func main() {
 	// Setup logger
@@ -41,9 +34,21 @@ func main() {
 	logger = log.New(logFile)
 	logger.SetLevel(log.InfoLevel)
 
+	type CLI struct {
+		commands.EmbeddingConfig
+		commands.CommonConfig
+	}
+
+	var cli CLI
+	_ = kong.Parse(&cli,
+		kong.Name("bank-mcp-server"),
+		kong.Description("Run the MCP server for bank transaction analysis"),
+		kong.UsageOnError(),
+	)
+
 	// Defaults
-	var tz = getEnv("TZ", "Australia/Melbourne")
-	var dataDir = getEnv("DATA_DIR", "./data")
+	var tz = cli.Timezone
+	var dataDir = cli.DataDir
 
 	// Load timezone
 	loc, err := time.LoadLocation(tz)
@@ -59,12 +64,8 @@ func main() {
 		logger.Fatal("Failed to initialize database", "error", err)
 	}
 
-	// Initialize embedding provider
-	embeddingProvider, err := commands.SetupEmbeddingProvider(context.Background(), commands.EmbeddingOptions{
-		Provider:      getEnv("EMBEDDING_PROVIDER", "llamacpp"),
-		LlamaCppModel: getEnv("LLAMACPP_EMBEDDING_MODEL", "snowflake-arctic-embed-l-v2.0-f16"),
-		Logger:        logger,
-	})
+	// Initialize embedding provider using Kong-parsed CLI values
+	embeddingProvider, err := commands.SetupEmbeddingProvider(context.Background(), cli.EmbeddingConfig, logger)
 	if err != nil {
 		logger.Fatal("Failed to initialize embedding provider", "error", err)
 	}

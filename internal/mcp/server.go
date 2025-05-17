@@ -73,6 +73,15 @@ func (s *Server) Run() error {
 		mcp.WithString("bank",
 			mcp.Description("Filter by bank/source (e.g. 'amex', 'ing-australia')"),
 		),
+		mcp.WithString("amount",
+			mcp.Description("Filter by exact amount (e.g. '326.02')"),
+		),
+		mcp.WithString("min_amount",
+			mcp.Description("Filter by minimum amount (e.g. '100')"),
+		),
+		mcp.WithString("max_amount",
+			mcp.Description("Filter by maximum amount (e.g. '500')"),
+		),
 	), s.listTransactionsHandler)
 
 	mcpServer.AddTool(mcp.NewTool("list_categories",
@@ -89,6 +98,26 @@ func (s *Server) Run() error {
 	mcpServer.AddTool(mcp.NewTool("list_banks",
 		mcp.WithDescription("List all available banks/sources for transactions"),
 	), s.listBanksHandler)
+
+	mcpServer.AddTool(mcp.NewTool("update_transaction",
+		mcp.WithDescription("Update merchant, type, details_category, or tags for a transaction by ID"),
+		mcp.WithString("id",
+			mcp.Required(),
+			mcp.Description("Transaction ID to update"),
+		),
+		mcp.WithString("merchant",
+			mcp.Description("New merchant name (optional)"),
+		),
+		mcp.WithString("type",
+			mcp.Description("New transaction type (optional)"),
+		),
+		mcp.WithString("details_category",
+			mcp.Description("New transaction category (optional)"),
+		),
+		mcp.WithString("tags",
+			mcp.Description("Comma-separated tags to add (optional)"),
+		),
+	), s.updateTransactionHandler)
 
 	// Start the stdio server
 	if err := server.ServeStdio(mcpServer); err != nil {
@@ -138,6 +167,10 @@ func (s *Server) searchTransactionsHandler(ctx context.Context, request mcp.Call
 		}
 	}
 
+	// Get bank filter if provided
+	//bank, _ := request.Params.Arguments["bank"].(string)
+
+	// Perform the search
 	searchResults, err := s.analyzer.HybridSearch(ctx, query, days, limit, 0.4)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search transactions: %w", err)
@@ -236,36 +269,49 @@ func (s *Server) listTransactionsHandler(ctx context.Context, request mcp.CallTo
 	txType, _ := request.Params.Arguments["type"].(string)
 	category, _ := request.Params.Arguments["category"].(string)
 	bank, _ := request.Params.Arguments["bank"].(string)
+	minAmount, hasMinAmount := request.Params.Arguments["min_amount"].(string)
+	maxAmount, hasMaxAmount := request.Params.Arguments["max_amount"].(string)
 
-	// First, count total transactions for the period
-	totalCount, err := s.db.CountTransactions(ctx, days)
-	if err != nil {
-		return nil, fmt.Errorf("failed to count transactions: %w", err)
+	// Parse amount parameters
+	if !hasMinAmount && !hasMaxAmount {
+		// Also check for exact amount
+		if exactAmount, hasExactAmount := request.Params.Arguments["amount"].(string); hasExactAmount {
+			// Use the exact amount as both min and max for absolute value filtering
+			minAmount = exactAmount
+			maxAmount = exactAmount
+			hasMinAmount = true
+			hasMaxAmount = true
+		}
 	}
 
 	// Use GetTransactions with the limit parameter and 0 offset
-	transactions, err := s.db.GetTransactions(ctx, days, limit, 0)
+	var opts []db.GetTransactionsOption
+	opts = append(opts, db.FilterByDays(days))
+	opts = append(opts, db.WithLimit(limit))
+	if category != "" {
+		opts = append(opts, db.FilterByCategory(category))
+	}
+	if txType != "" {
+		opts = append(opts, db.FilterByType(txType))
+	}
+	if bank != "" {
+		opts = append(opts, db.FilterByBank(bank))
+	}
+	// Add amount filters if provided
+	if hasMinAmount && hasMaxAmount {
+		// Convert to absolute value filtering
+		opts = append(opts, db.FilterByAbsoluteAmount(minAmount, maxAmount))
+	} else if hasMinAmount {
+		opts = append(opts, db.FilterByAbsoluteAmount(minAmount, ""))
+	} else if hasMaxAmount {
+		opts = append(opts, db.FilterByAbsoluteAmount("", maxAmount))
+	}
+	transactions, err := s.db.GetTransactions(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list transactions: %w", err)
 	}
 
-	// Filter transactions by type, category, and bank if specified
-	var filtered []types.TransactionWithDetails
-	for _, t := range transactions {
-		// Skip if type filter is set and doesn't match
-		if txType != "" && string(t.Details.Type) != txType {
-			continue
-		}
-		// Skip if category filter is set and doesn't match
-		if category != "" && t.Details.Category != category {
-			continue
-		}
-		// Skip if bank filter is set and doesn't match
-		if bank != "" && t.Bank != bank {
-			continue
-		}
-		filtered = append(filtered, t)
-	}
+	filtered := transactions // DB now handles filtering
 
 	// Format transactions as text
 	var result string
@@ -275,7 +321,7 @@ func (s *Server) listTransactionsHandler(ctx context.Context, request mcp.CallTo
 		result += "No transactions found matching your criteria.\n\n"
 	} else {
 		// Determine if we're showing limited results
-		if txType != "" || category != "" || bank != "" {
+		if txType != "" || category != "" || bank != "" || hasMinAmount || hasMaxAmount {
 			// When filtering by type, category, or bank, just show the filtered count
 			result += fmt.Sprintf("Found %d transactions", len(filtered))
 			if txType != "" {
@@ -287,11 +333,20 @@ func (s *Server) listTransactionsHandler(ctx context.Context, request mcp.CallTo
 			if bank != "" {
 				result += fmt.Sprintf(" from bank '%s'", bank)
 			}
+
+			// Add message about amount filtering for clarity
+			if hasMinAmount && hasMaxAmount && minAmount == maxAmount {
+				// Exact amount search
+				result += fmt.Sprintf(" with absolute amount %s", minAmount)
+			} else if hasMinAmount && hasMaxAmount {
+				result += fmt.Sprintf(" with absolute amount between %s and %s", minAmount, maxAmount)
+			} else if hasMinAmount {
+				result += fmt.Sprintf(" with minimum absolute amount %s", minAmount)
+			} else if hasMaxAmount {
+				result += fmt.Sprintf(" with maximum absolute amount %s", maxAmount)
+			}
+
 			result += ":\n\n"
-		} else if len(filtered) < totalCount {
-			// When showing fewer than the total due to limit
-			result += fmt.Sprintf("Showing %d of %d transactions (most recent first):\n\n",
-				len(filtered), totalCount)
 		} else {
 			result += fmt.Sprintf("Found %d transactions:\n\n", len(filtered))
 		}
@@ -391,4 +446,50 @@ func (s *Server) listBanksHandler(ctx context.Context, request mcp.CallToolReque
 		result += "- " + bank + "\n"
 	}
 	return mcp.NewToolResultText(result), nil
+}
+
+// Handler for update_transaction
+func (s *Server) updateTransactionHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	id, ok := request.Params.Arguments["id"].(string)
+	if !ok || id == "" {
+		return nil, errors.New("id is required and must be a string")
+	}
+
+	var merchant, txType, category, tags *string
+
+	if v, ok := request.Params.Arguments["merchant"].(string); ok && v != "" {
+		merchant = &v
+	}
+	if v, ok := request.Params.Arguments["type"].(string); ok && v != "" {
+		// Validate type
+		if _, valid := types.AllowedTypesMap[v]; !valid {
+			var allowed []string
+			for k := range types.AllowedTypesMap {
+				allowed = append(allowed, k)
+			}
+			return nil, fmt.Errorf("invalid type '%s'. Allowed types: %v", v, allowed)
+		}
+		txType = &v
+	}
+	if v, ok := request.Params.Arguments["details_category"].(string); ok && v != "" {
+		// Validate category
+		if _, valid := types.AllowedCategoriesMap[v]; !valid {
+			var allowed []string
+			for k := range types.AllowedCategoriesMap {
+				allowed = append(allowed, k)
+			}
+			return nil, fmt.Errorf("invalid category '%s'. Allowed categories: %v", v, allowed)
+		}
+		category = &v
+	}
+	if v, ok := request.Params.Arguments["tags"].(string); ok && v != "" {
+		tags = &v
+	}
+
+	err := s.db.UpdateTransaction(ctx, id, merchant, txType, category, tags)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update transaction: %w", err)
+	}
+
+	return mcp.NewToolResultText("Transaction updated successfully."), nil
 }

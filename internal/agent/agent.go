@@ -13,6 +13,9 @@ import (
 // It should return (parsedResult, nil) on success, or (nil, error) on failure.
 type ToolCallValidator func(toolCall openai.ToolCall) (any, error)
 
+// ShouldStopFunc determines if the tool call is a terminal/final action.
+type ShouldStopFunc func(toolCall openai.ToolCall) bool
+
 // Agent encapsulates OpenAI tool-calling logic.
 type Agent struct {
 	logger      *log.Logger
@@ -49,6 +52,7 @@ func (a *Agent) RunLoop(
 	initialMessages []openai.ChatCompletionMessage,
 	tools []openai.Tool,
 	validator ToolCallValidator,
+	shouldStop ShouldStopFunc,
 	maxLoop int,
 ) (any, error) {
 	var (
@@ -88,7 +92,16 @@ func (a *Agent) RunLoop(
 		parsed, err := validator(toolCall)
 		if err == nil {
 			a.logger.Debug("Tool call validated successfully", "toolCall", toolCall)
-			return parsed, nil
+			if shouldStop == nil || shouldStop(toolCall) {
+				return parsed, nil
+			}
+			// Add the tool result as a new message and continue the loop
+			chatMessages = append(chatMessages, openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleTool,
+				Content: fmt.Sprintf("Tool result: %v", parsed),
+				Name:    toolCall.Function.Name,
+			})
+			continue
 		}
 		a.logger.Debug("Tool call validation failed", "toolCall", toolCall, "error", err)
 		lastError = err

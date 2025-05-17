@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 
-	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
 	"github.com/lox/bank-transaction-analyzer/internal/bank"
 	"github.com/lox/bank-transaction-analyzer/internal/qif"
 	"github.com/lox/bank-transaction-analyzer/internal/types"
@@ -45,9 +44,14 @@ func (a *Amex) ParseTransactions(ctx context.Context, r io.Reader) ([]types.Tran
 	return transactions, nil
 }
 
-// ProcessTransactions processes transactions using the analyzer
-func (a *Amex) ProcessTransactions(ctx context.Context, transactions []types.Transaction, an *analyzer.Analyzer, config analyzer.Config) ([]types.TransactionWithDetails, error) {
-	return an.AnalyzeTransactions(ctx, transactions, config)
+// AdditionalPromptRules returns Amex-specific rules for prompt injection (none for now)
+func (a *Amex) AdditionalPromptRules() string {
+	return `
+- For positive amounts like "DIRECT DEBIT RECEIVED", categorize as type="payment" and category="Credit Card Payment" instead of deposit/Other.
+- When merchant contains "DIRECT DEBIT", set description to "Credit card payment from bank account".
+- These transactions represent payments received from a bank account to pay down credit card balance.
+- Ensure the relationship with the corresponding bank payment is clear.
+`
 }
 
 // Ensure Amex implements the Bank interface

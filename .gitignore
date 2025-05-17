@@ -1,3 +1,4 @@
 *.qif
 /*.log
 /data/
+/bankexports

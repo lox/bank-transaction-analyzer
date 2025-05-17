@@ -30,7 +30,13 @@ type Migration struct {
 //	 },
 //	},
 var migrations = []Migration{
-	// Migrations will be added here as needed
+	{
+		ID: 1,
+		Up: func(db *sql.DB) error {
+			_, err := db.Exec(`ALTER TABLE transactions ADD COLUMN tags TEXT;`)
+			return err
+		},
+	},
 }
 
 // ApplyMigrations applies all pending migrations to the database.
