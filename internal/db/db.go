@@ -21,6 +21,11 @@ import (
 	"github.com/lox/bank-transaction-analyzer/internal/types"
 )
 
+const (
+	OrderByRelevance = "relevance"
+	OrderByDate      = "date"
+)
+
 // Schema defines the database schema
 var schema = `
 CREATE TABLE IF NOT EXISTS transactions (
@@ -388,16 +393,17 @@ func (d *DB) GetTransactionByID(ctx context.Context, id string) (*types.Transact
 	t.Amount = amount.String()
 
 	// Set foreign amount if present
-	setForeignAmount(&t, foreignAmount, foreignCurrency)
+	SetForeignAmount(&t, foreignAmount, foreignCurrency)
 
 	// Set transfer details if present
-	setTransferDetails(&t, transferToAccount, transferFromAccount, transferReference)
+	SetTransferDetails(&t, transferToAccount, transferFromAccount, transferReference)
 
 	return &t, nil
 }
 
-// GetTransactionsOptions defines options for filtering and paginating transactions
-type GetTransactionsOptions struct {
+// TransactionQueryOptions defines options for filtering and paginating transactions
+// (no Query field)
+type TransactionQueryOptions struct {
 	Days         int
 	Limit        int
 	Offset       int
@@ -410,76 +416,130 @@ type GetTransactionsOptions struct {
 	AbsMaxAmount string // For absolute value filtering
 }
 
-// GetTransactionsOption is a function that modifies GetTransactionsOptions
-type GetTransactionsOption func(*GetTransactionsOptions)
+// TransactionQueryOption is a function that modifies TransactionQueryOptions
+type TransactionQueryOption func(*TransactionQueryOptions)
 
 // FilterByDays sets the number of days to look back
-func FilterByDays(days int) GetTransactionsOption {
-	return func(opts *GetTransactionsOptions) {
+func FilterByDays(days int) TransactionQueryOption {
+	return func(opts *TransactionQueryOptions) {
 		opts.Days = days
 	}
 }
 
 // FilterByCategory sets the category filter
-func FilterByCategory(category string) GetTransactionsOption {
-	return func(opts *GetTransactionsOptions) {
+func FilterByCategory(category string) TransactionQueryOption {
+	return func(opts *TransactionQueryOptions) {
 		opts.Category = category
 	}
 }
 
 // FilterByType sets the type filter
-func FilterByType(txType string) GetTransactionsOption {
-	return func(opts *GetTransactionsOptions) {
+func FilterByType(txType string) TransactionQueryOption {
+	return func(opts *TransactionQueryOptions) {
 		opts.Type = txType
 	}
 }
 
 // FilterByBank sets the bank filter
-func FilterByBank(bank string) GetTransactionsOption {
-	return func(opts *GetTransactionsOptions) {
+func FilterByBank(bank string) TransactionQueryOption {
+	return func(opts *TransactionQueryOptions) {
 		opts.Bank = bank
 	}
 }
 
 // FilterByAmount sets both minimum and maximum amount filters
-func FilterByAmount(minAmount, maxAmount string) GetTransactionsOption {
-	return func(opts *GetTransactionsOptions) {
+func FilterByAmount(minAmount, maxAmount string) TransactionQueryOption {
+	return func(opts *TransactionQueryOptions) {
 		opts.MinAmount = minAmount
 		opts.MaxAmount = maxAmount
 	}
 }
 
 // FilterByAbsoluteAmount sets min and max filters using absolute values
-func FilterByAbsoluteAmount(minAmount, maxAmount string) GetTransactionsOption {
-	return func(opts *GetTransactionsOptions) {
+func FilterByAbsoluteAmount(minAmount, maxAmount string) TransactionQueryOption {
+	return func(opts *TransactionQueryOptions) {
 		opts.AbsMinAmount = minAmount
 		opts.AbsMaxAmount = maxAmount
 	}
 }
 
 // WithLimit sets the limit
-func WithLimit(limit int) GetTransactionsOption {
-	return func(opts *GetTransactionsOptions) {
+func WithLimit(limit int) TransactionQueryOption {
+	return func(opts *TransactionQueryOptions) {
 		opts.Limit = limit
 	}
 }
 
 // WithOffset sets the offset
-func WithOffset(offset int) GetTransactionsOption {
-	return func(opts *GetTransactionsOptions) {
+func WithOffset(offset int) TransactionQueryOption {
+	return func(opts *TransactionQueryOptions) {
 		opts.Offset = offset
 	}
 }
 
+// Helper to add amount filters to where/params
+func addAmountFilters(opts TransactionQueryOptions, where []string, params []any) ([]string, []any) {
+	if opts.AbsMinAmount != "" && opts.AbsMaxAmount != "" {
+		if opts.AbsMinAmount == opts.AbsMaxAmount {
+			where = append(where, "(t.amount = ? OR t.amount = -?)")
+			params = append(params, opts.AbsMinAmount, opts.AbsMinAmount)
+		} else {
+			where = append(where, "(t.amount >= ? OR t.amount <= -?)")
+			where = append(where, "(t.amount <= ? AND t.amount >= -?)")
+			params = append(params, opts.AbsMinAmount, opts.AbsMinAmount, opts.AbsMaxAmount, opts.AbsMaxAmount)
+		}
+	} else if opts.AbsMinAmount != "" {
+		where = append(where, "(t.amount >= ? OR t.amount <= -?)")
+		params = append(params, opts.AbsMinAmount, opts.AbsMinAmount)
+	} else if opts.AbsMaxAmount != "" {
+		where = append(where, "(t.amount <= ? AND t.amount >= -?)")
+		params = append(params, opts.AbsMaxAmount, opts.AbsMaxAmount)
+	} else if opts.MinAmount != "" && opts.MaxAmount != "" {
+		where = append(where, "t.amount BETWEEN ? AND ?")
+		params = append(params, opts.MinAmount, opts.MaxAmount)
+	} else if opts.MinAmount != "" {
+		where = append(where, "t.amount >= ?")
+		params = append(params, opts.MinAmount)
+	} else if opts.MaxAmount != "" {
+		where = append(where, "t.amount <= ?")
+		params = append(params, opts.MaxAmount)
+	}
+	return where, params
+}
+
+// Helper to build WHERE clause and params for transaction queries
+func BuildTransactionWhereClause(opts TransactionQueryOptions, withFTS bool) ([]string, []any) {
+	var where []string
+	var params []any
+	if withFTS {
+		// FTS query string should be passed as the first param by the caller
+		where = append(where, "fts.search_body MATCH ?")
+	}
+	if opts.Days > 0 {
+		where = append(where, "t.date >= date('now', ? )")
+		params = append(params, fmt.Sprintf("%d days", -opts.Days))
+	}
+	if opts.Category != "" {
+		where = append(where, "t.details_category = ?")
+		params = append(params, opts.Category)
+	}
+	if opts.Type != "" {
+		where = append(where, "t.type = ?")
+		params = append(params, opts.Type)
+	}
+	if opts.Bank != "" {
+		where = append(where, "t.bank = ?")
+		params = append(params, opts.Bank)
+	}
+	where, params = addAmountFilters(opts, where, params)
+	return where, params
+}
+
 // GetTransactions returns transactions with details from the last N days
 // with optional limit, offset, and filters for category, type, and bank
-func (d *DB) GetTransactions(ctx context.Context, options ...GetTransactionsOption) ([]types.TransactionWithDetails, error) {
+func (d *DB) GetTransactions(ctx context.Context, options ...TransactionQueryOption) ([]types.TransactionWithDetails, error) {
 	// Set defaults
-	opts := GetTransactionsOptions{
-		Days:   30,
-		Limit:  50,
-		Offset: 0,
-	}
+	opts := TransactionQueryOptions{}
 	for _, opt := range options {
 		opt(&opts)
 	}
@@ -491,72 +551,24 @@ func (d *DB) GetTransactions(ctx context.Context, options ...GetTransactionsOpti
 			t.foreign_amount, t.foreign_currency,
 			t.transfer_to_account, t.transfer_from_account, t.transfer_reference
 		FROM transactions t
-		WHERE t.date >= date('now', ? || ' days')
 	`
-	params := []interface{}{-opts.Days}
-
-	if opts.Category != "" {
-		query += " AND t.details_category = ?"
-		params = append(params, opts.Category)
+	where, params := BuildTransactionWhereClause(opts, false)
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
 	}
-	if opts.Type != "" {
-		query += " AND t.type = ?"
-		params = append(params, opts.Type)
-	}
-	if opts.Bank != "" {
-		query += " AND t.bank = ?"
-		params = append(params, opts.Bank)
-	}
-
-	// Handle absolute value filtering
-	if opts.AbsMinAmount != "" && opts.AbsMaxAmount != "" {
-		// When min and max are the same, it's an exact amount search
-		if opts.AbsMinAmount == opts.AbsMaxAmount {
-			query += " AND (t.amount = ? OR t.amount = -?)"
-			params = append(params, opts.AbsMinAmount, opts.AbsMinAmount)
-		} else {
-			// Range search: amount >= min OR amount <= -min, AND amount <= max AND amount >= -max
-			query += " AND (t.amount >= ? OR t.amount <= -?)"
-			query += " AND (t.amount <= ? AND t.amount >= -?)"
-			params = append(params, opts.AbsMinAmount, opts.AbsMinAmount, opts.AbsMaxAmount, opts.AbsMaxAmount)
-		}
-	} else if opts.AbsMinAmount != "" {
-		query += " AND (t.amount >= ? OR t.amount <= -?)"
-		params = append(params, opts.AbsMinAmount, opts.AbsMinAmount)
-	} else if opts.AbsMaxAmount != "" {
-		query += " AND (t.amount <= ? AND t.amount >= -?)"
-		params = append(params, opts.AbsMaxAmount, opts.AbsMaxAmount)
-	} else if opts.MinAmount != "" && opts.MaxAmount != "" {
-		// Original amount filtering (non-absolute)
-		query += " AND t.amount BETWEEN ? AND ?"
-		params = append(params, opts.MinAmount, opts.MaxAmount)
-	} else if opts.MinAmount != "" {
-		query += " AND t.amount >= ?"
-		params = append(params, opts.MinAmount)
-	} else if opts.MaxAmount != "" {
-		query += " AND t.amount <= ?"
-		params = append(params, opts.MaxAmount)
-	}
-
 	query += " ORDER BY t.date DESC"
-
-	// Add limit and offset if provided
 	if opts.Limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d", opts.Limit)
 		if opts.Offset > 0 {
 			query += fmt.Sprintf(" OFFSET %d", opts.Offset)
 		}
 	}
-
-	// Log the SQL query with parameters for debugging
 	d.logger.Debug("Executing SQL query", "query", query, "params", params)
-
 	rows, err := d.db.QueryContext(ctx, query, params...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query transactions: %w", err)
 	}
 	defer rows.Close()
-
 	var transactions []types.TransactionWithDetails
 	for rows.Next() {
 		var t types.TransactionWithDetails
@@ -565,32 +577,41 @@ func (d *DB) GetTransactions(ctx context.Context, options ...GetTransactionsOpti
 		}
 		transactions = append(transactions, t)
 	}
-
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating transactions: %w", err)
 	}
-
 	return transactions, nil
 }
 
-// SearchTransactionsByText performs a full-text search on transactions
-func (d *DB) SearchTransactionsByText(ctx context.Context, query string, days int, limit int) ([]types.TransactionSearchResult, int, error) {
-	// First, get the total count without limit
+// SearchTransactionsByText performs a full-text search on transactions using a query and TransactionQueryOptions
+func (d *DB) SearchTransactionsByText(ctx context.Context, query string, orderBy string, opts ...TransactionQueryOption) ([]types.TransactionSearchResult, int, error) {
+	options := TransactionQueryOptions{}
+	for _, opt := range opts {
+		opt(&options)
+	}
+	where, params := BuildTransactionWhereClause(options, true)
+	params = append([]any{query}, params...)
+	whereClause := ""
+	if len(where) > 0 {
+		whereClause = "WHERE " + strings.Join(where, " AND ")
+	}
+	// Count query
 	countQuery := `
 		SELECT COUNT(*)
 		FROM transactions t
 		JOIN transactions_fts fts ON t.rowid = fts.rowid
-		WHERE fts.search_body MATCH ?
-		AND t.date >= date('now', ?)
+		` + whereClause + `
 	`
-
 	var totalCount int
-	err := d.db.QueryRowContext(ctx, countQuery, query, fmt.Sprintf("%d days", -days)).Scan(&totalCount)
+	err := d.db.QueryRowContext(ctx, countQuery, params...).Scan(&totalCount)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count text search results: %w", err)
 	}
-
-	// Then perform the search with limit
+	// Main search query
+	orderClause := "ORDER BY text_score DESC"
+	if orderBy == OrderByDate {
+		orderClause = "ORDER BY t.date DESC"
+	}
 	searchQuery := `
 		SELECT
 			t.date, t.amount, t.payee, t.bank,
@@ -600,24 +621,18 @@ func (d *DB) SearchTransactionsByText(ctx context.Context, query string, days in
 			bm25(transactions_fts) as text_score
 		FROM transactions t
 		JOIN transactions_fts fts ON t.rowid = fts.rowid
-		WHERE fts.search_body MATCH ?
-		AND t.date >= date('now', ?)
-		ORDER BY text_score DESC
-		LIMIT ?
+		` + whereClause + `
+		` + orderClause + `
 	`
-
-	rows, err := d.db.QueryContext(ctx, searchQuery, query, fmt.Sprintf("%d days", -days), limit)
+	rows, err := d.db.QueryContext(ctx, searchQuery, params...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("text search failed: %w", err)
 	}
 	defer rows.Close()
-
 	var results []types.TransactionSearchResult
 	for rows.Next() {
 		var t types.TransactionWithDetails
 		var textScore float64
-
-		// Scan all transaction fields plus the text score
 		var date time.Time
 		var amount decimal.Decimal
 		var foreignAmount sql.NullFloat64
@@ -625,7 +640,6 @@ func (d *DB) SearchTransactionsByText(ctx context.Context, query string, days in
 		var transferToAccount sql.NullString
 		var transferFromAccount sql.NullString
 		var transferReference sql.NullString
-
 		if err := rows.Scan(
 			&date, &amount, &t.Payee, &t.Bank,
 			&t.Details.Type, &t.Details.Merchant, &t.Details.Location, &t.Details.Category, &t.Details.Description, &t.Details.CardNumber,
@@ -635,38 +649,33 @@ func (d *DB) SearchTransactionsByText(ctx context.Context, query string, days in
 		); err != nil {
 			return nil, 0, fmt.Errorf("failed to scan transaction: %w", err)
 		}
-
 		// Format date and amount as strings
 		t.Date = date.Format("02/01/2006")
 		t.Amount = amount.String()
-
-		// Set foreign amount if present
-		setForeignAmount(&t, foreignAmount, foreignCurrency)
-
-		// Set transfer details if present
-		setTransferDetails(&t, transferToAccount, transferFromAccount, transferReference)
-
-		// Create the search result with the text score
+		SetForeignAmount(&t, foreignAmount, foreignCurrency)
+		SetTransferDetails(&t, transferToAccount, transferFromAccount, transferReference)
 		result := types.TransactionSearchResult{
 			TransactionWithDetails: t,
 			Scores: types.SearchScore{
 				TextScore: textScore,
 			},
 		}
-
 		results = append(results, result)
 	}
-
 	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("error iterating text results: %w", err)
 	}
-
+	// Apply offset and limit to results
+	start := options.Offset
+	if start > len(results) {
+		start = len(results)
+	}
+	end := len(results)
+	if options.Limit > 0 && start+options.Limit < end {
+		end = start + options.Limit
+	}
+	results = results[start:end]
 	return results, totalCount, nil
-}
-
-// DB returns the underlying database connection
-func (d *DB) DB() *sql.DB {
-	return d.db
 }
 
 // CategoryCount represents a category and its transaction count
@@ -774,16 +783,16 @@ func scanTransactionRow(rows *sql.Rows, t *types.TransactionWithDetails) error {
 	t.Details.SearchBody = searchBody
 
 	// Set foreign amount if present
-	setForeignAmount(t, foreignAmount, foreignCurrency)
+	SetForeignAmount(t, foreignAmount, foreignCurrency)
 
 	// Set transfer details if present
-	setTransferDetails(t, transferToAccount, transferFromAccount, transferReference)
+	SetTransferDetails(t, transferToAccount, transferFromAccount, transferReference)
 
 	return nil
 }
 
-// setForeignAmount sets the foreign amount details on a transaction if present
-func setForeignAmount(t *types.TransactionWithDetails, amount sql.NullFloat64, currency sql.NullString) {
+// SetForeignAmount sets the foreign amount details on a transaction if present
+func SetForeignAmount(t *types.TransactionWithDetails, amount sql.NullFloat64, currency sql.NullString) {
 	if amount.Valid && currency.Valid {
 		t.Details.ForeignAmount = &types.ForeignAmountDetails{
 			Amount:   decimal.NewFromFloat(amount.Float64),
@@ -792,8 +801,8 @@ func setForeignAmount(t *types.TransactionWithDetails, amount sql.NullFloat64, c
 	}
 }
 
-// setTransferDetails sets the transfer details on a transaction if present
-func setTransferDetails(t *types.TransactionWithDetails, toAccount, fromAccount, reference sql.NullString) {
+// SetTransferDetails sets the transfer details on a transaction if present
+func SetTransferDetails(t *types.TransactionWithDetails, toAccount, fromAccount, reference sql.NullString) {
 	if toAccount.Valid || fromAccount.Valid || reference.Valid {
 		t.Details.TransferDetails = &types.TransferDetails{
 			ToAccount:   toAccount.String,
@@ -885,4 +894,9 @@ func (it *TransactionIterator) Next() (*types.TransactionWithDetails, bool) {
 		return nil, false
 	}
 	return &t, true
+}
+
+// DB returns the underlying *sql.DB
+func (d *DB) DB() *sql.DB {
+	return d.db
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/charmbracelet/log"
@@ -23,14 +24,51 @@ type VectorResult struct {
 	Content string
 }
 
+type EmbeddingMetadata struct {
+	ContentHash string    `json:"content_hash"`
+	ModelName   string    `json:"model_name"`
+	Length      int       `json:"length"`
+	LastUpdated time.Time `json:"last_updated"`
+}
+
+func (m *EmbeddingMetadata) ToMap() map[string]string {
+	return map[string]string{
+		"content_hash": m.ContentHash,
+		"model_name":   m.ModelName,
+		"length":       strconv.Itoa(m.Length),
+		"last_updated": m.LastUpdated.Format(time.RFC3339),
+	}
+}
+
+func EmbeddingFromMap(metadata map[string]string) (EmbeddingMetadata, error) {
+	length, err := strconv.Atoi(metadata["length"])
+	if err != nil {
+		return EmbeddingMetadata{}, fmt.Errorf("failed to parse length: %w", err)
+	}
+	lastUpdated, err := time.Parse(time.RFC3339, metadata["last_updated"])
+	if err != nil {
+		return EmbeddingMetadata{}, fmt.Errorf("failed to parse last updated: %w", err)
+	}
+	return EmbeddingMetadata{
+		ContentHash: metadata["content_hash"],
+		ModelName:   metadata["model_name"],
+		Length:      length,
+		LastUpdated: lastUpdated,
+	}, nil
+}
+
+func (m *EmbeddingMetadata) MatchContent(content string) bool {
+	return m.ContentHash == Hash(content)
+}
+
 // VectorStorage is an interface for storing and retrieving vector embeddings
 type VectorStorage interface {
 	// StoreEmbedding stores an embedding with the given transaction ID
-	StoreEmbedding(ctx context.Context, id string, text string, embedding []float32) error
+	StoreEmbedding(ctx context.Context, id string, text string, embedding []float32, metadata EmbeddingMetadata) error
 
-	// HasEmbedding checks if an embedding exists for the given transaction ID and content
-	// If content is provided, it will also check if the stored content hash matches
-	HasEmbedding(ctx context.Context, id string, content string) (bool, error)
+	// HasEmbedding checks if an embedding exists for the given transaction ID
+	// and returns the metadata if it does
+	HasEmbedding(ctx context.Context, id string) (bool, EmbeddingMetadata, error)
 
 	// Query finds transaction IDs similar to the given embedding
 	// threshold sets the minimum similarity score (0.0-1.0) for results
@@ -39,6 +77,9 @@ type VectorStorage interface {
 
 	// Close closes the storage
 	Close() error
+
+	// RemoveEmbedding removes an embedding/document by ID from the collection
+	RemoveEmbedding(ctx context.Context, id string) error
 }
 
 // ChromemStorage implements VectorStorage using chromem-go vector database
@@ -49,8 +90,8 @@ type ChromemStorage struct {
 	modelName  string
 }
 
-// hashContent creates a SHA-256 hash of the content
-func hashContent(content string) string {
+// Hash creates a SHA-256 hash of the content
+func Hash(content string) string {
 	hash := sha256.Sum256([]byte(content))
 	return hex.EncodeToString(hash[:])
 }
@@ -99,22 +140,10 @@ func (s *ChromemStorage) StoreEmbedding(
 	id string,
 	text string,
 	embedding []float32,
+	metadata EmbeddingMetadata,
 ) error {
-	// Create a document with just the transaction ID
-	// The content is the search text that was embedded
-	startTime := time.Now()
-
-	// Generate content hash to store with the document
-	contentHash := hashContent(text)
-
-	// Create metadata with the content hash and model info
-	metadata := map[string]string{
-		"content_hash": contentHash,
-		"model_name":   s.modelName,
-	}
-
 	// Create a document to add to the collection
-	doc, err := chromem.NewDocument(ctx, id, metadata, embedding, text, nil)
+	doc, err := chromem.NewDocument(ctx, id, metadata.ToMap(), embedding, text, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create document: %w", err)
 	}
@@ -127,78 +156,29 @@ func (s *ChromemStorage) StoreEmbedding(
 
 	s.logger.Debug("Stored embedding",
 		"id", id,
-		"text_length", len(text),
-		"vector_size", len(embedding),
-		"model_name", s.modelName,
-		"content_hash", contentHash,
-		"duration", time.Since(startTime))
+		"metadata", metadata)
 
 	return nil
 }
 
 // HasEmbedding checks if an embedding exists for the given transaction ID and content
-func (s *ChromemStorage) HasEmbedding(ctx context.Context, id string, content string) (bool, error) {
-	startTime := time.Now()
-
+func (s *ChromemStorage) HasEmbedding(ctx context.Context, id string) (bool, EmbeddingMetadata, error) {
 	// Check if the document exists by trying to get it
 	doc, err := s.collection.GetByID(ctx, id)
 	if err != nil {
-		return false, nil
+		return false, EmbeddingMetadata{}, nil
 	}
 
-	// If we found the document but don't have content to check, it exists
-	if content == "" {
-		s.logger.Debug("Document exists (no content check)",
-			"id", id,
-			"duration", time.Since(startTime))
-		return true, nil
+	metadata, err := EmbeddingFromMap(doc.Metadata)
+	if err != nil {
+		return false, EmbeddingMetadata{}, fmt.Errorf("failed to parse metadata for id %s: %w", id, err)
 	}
 
-	// Generate hash of the provided content
-	newContentHash := hashContent(content)
-
-	// Check if the document has metadata with content_hash
-	metadata := doc.Metadata
-	if metadata == nil {
-		// No metadata, we need to update the embedding
-		s.logger.Debug("Document exists but has no content hash",
-			"id", id,
-			"duration", time.Since(startTime))
-		return false, nil
-	}
-
-	// Get the stored content hash
-	storedHash, ok := metadata["content_hash"]
-	if !ok {
-		// No content hash in metadata, we need to update the embedding
-		s.logger.Debug("Document exists but has no content hash in metadata",
-			"id", id,
-			"duration", time.Since(startTime))
-		return false, nil
-	}
-
-	// Check model name
-	storedModelName := metadata["model_name"]
-
-	// Debug log for comparison
-	s.logger.Debug("Embedding comparison",
-		"id", id,
-		"stored_model_name", storedModelName,
-		"current_model_name", s.modelName,
-		"stored_hash", storedHash,
-		"new_hash", newContentHash,
-	)
-
-	// Compare the hashes
-	matches := storedHash == newContentHash && storedModelName == s.modelName
-
-	return matches, nil
+	return true, metadata, nil
 }
 
 // QuerySimilar finds transaction IDs similar to the given embedding
 func (s *ChromemStorage) Query(ctx context.Context, embedding []float32, threshold float32) ([]VectorResult, error) {
-	startTime := time.Now()
-
 	// Query for similar documents
 	results, err := s.collection.QueryEmbedding(ctx, embedding, s.collection.Count(), nil, nil)
 	if err != nil {
@@ -224,11 +204,6 @@ func (s *ChromemStorage) Query(ctx context.Context, embedding []float32, thresho
 		return vectorResults[i].Similarity > vectorResults[j].Similarity
 	})
 
-	s.logger.Debug("Vector query completed",
-		"results", len(vectorResults),
-		"model_name", s.modelName,
-		"duration", time.Since(startTime))
-
 	return vectorResults, nil
 }
 
@@ -237,4 +212,9 @@ func (s *ChromemStorage) Close() error {
 	// Nothing to do as chromem doesn't have an explicit close method
 	// The database is automatically persisted on write operations
 	return nil
+}
+
+// RemoveEmbedding removes an embedding/document by ID from the collection
+func (s *ChromemStorage) RemoveEmbedding(ctx context.Context, id string) error {
+	return s.collection.Delete(ctx, nil, nil, id)
 }

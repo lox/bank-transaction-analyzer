@@ -9,7 +9,6 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/charmbracelet/log"
-	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
 	"github.com/lox/bank-transaction-analyzer/internal/bank"
 	"github.com/lox/bank-transaction-analyzer/internal/bank/amex"
 	"github.com/lox/bank-transaction-analyzer/internal/bank/ing"
@@ -76,16 +75,13 @@ func main() {
 		logger.Fatal("Failed to initialize vector storage", "error", err)
 	}
 
-	// Initialize analyzer
-	txAnalyzer := analyzer.NewAnalyzer(nil, logger, database, embeddingProvider, vectorStorage)
-
 	// Initialize bank registry and register banks
 	bankRegistry := bank.NewRegistry()
 	bankRegistry.Register(ing.New())
 	bankRegistry.Register(amex.New())
 
 	logger.Info("Starting MCP server")
-	s := mcp.New(database, txAnalyzer, logger, bankRegistry.List())
+	s := mcp.New(database, logger, embeddingProvider, vectorStorage, bankRegistry.List())
 	if err := s.Run(); err != nil {
 		panic(err)
 	}

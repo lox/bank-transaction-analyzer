@@ -129,7 +129,7 @@ func TestSearchTransactions(t *testing.T) {
 	}
 
 	// Test text search
-	textResults, totalCount, err := db.SearchTransactionsByText(ctx, "coffee", 30, 10)
+	textResults, totalCount, err := db.SearchTransactionsByText(ctx, "coffee", OrderByRelevance, FilterByDays(30), WithLimit(10))
 	if err != nil {
 		t.Fatalf("Failed to search transactions: %v", err)
 	}
@@ -455,7 +455,7 @@ func TestFilterByAbsoluteAmount(t *testing.T) {
 	}
 
 	// Directly query the database to see how amounts are stored
-	rows, err := db.DB().QueryContext(ctx, "SELECT payee, amount, typeof(amount) FROM transactions")
+	rows, err := db.db.QueryContext(ctx, "SELECT payee, amount, typeof(amount) FROM transactions")
 	if err != nil {
 		t.Fatalf("Failed to query transactions: %v", err)
 	}

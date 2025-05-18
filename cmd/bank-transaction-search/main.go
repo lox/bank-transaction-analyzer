@@ -9,10 +9,10 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/charmbracelet/log"
-	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
 	"github.com/lox/bank-transaction-analyzer/internal/commands"
 	"github.com/lox/bank-transaction-analyzer/internal/db"
 	"github.com/lox/bank-transaction-analyzer/internal/embeddings"
+	"github.com/lox/bank-transaction-analyzer/internal/search"
 	"github.com/lox/bank-transaction-analyzer/internal/types"
 )
 
@@ -21,10 +21,11 @@ type CLI struct {
 	commands.EmbeddingConfig
 
 	Query     string  `help:"Search query - what you're looking for" required:""`
-	Days      int     `help:"Number of days to look back" default:"30"`
-	Limit     int     `help:"Maximum number of results to return" default:"100"`
+	Days      int     `help:"Number of days to look back"`
+	Limit     int     `help:"Maximum number of results to return"`
 	Method    string  `help:"Search method to use" default:"hybrid" enum:"text,vector,hybrid"`
-	Threshold float32 `help:"Minimum similarity score for search results (0.0-1.0)" default:"0.4"`
+	Threshold float32 `help:"Minimum similarity score for search results (0.0-1.0)" default:"0.5"`
+	OrderBy   string  `help:"Order results by" default:"relevance" enum:"relevance,date"`
 }
 
 func (c *CLI) Run() error {
@@ -42,22 +43,22 @@ func (c *CLI) Run() error {
 		return c.performTextSearch(ctx, database, logger)
 	case "vector":
 		// Initialize vector search components (needed for both vector and hybrid search)
-		embeddingProvider, _, txAnalyzer, err := c.setupVectorComponents(ctx, logger, database)
+		embeddingProvider, vectorStorage, err := c.setupVectorComponents(ctx, logger)
 		if err != nil {
 			return err
 		}
 		defer commands.CloseEmbeddingProvider(embeddingProvider, logger)
 
-		return c.performVectorSearch(ctx, txAnalyzer, logger)
+		return c.performVectorSearch(ctx, embeddingProvider, vectorStorage, database, logger)
 	case "hybrid":
 		// Initialize vector search components (needed for both vector and hybrid search)
-		embeddingProvider, _, txAnalyzer, err := c.setupVectorComponents(ctx, logger, database)
+		embeddingProvider, vectorStorage, err := c.setupVectorComponents(ctx, logger)
 		if err != nil {
 			return err
 		}
 		defer commands.CloseEmbeddingProvider(embeddingProvider, logger)
 
-		return c.performHybridSearch(ctx, txAnalyzer, logger)
+		return c.performHybridSearch(ctx, embeddingProvider, vectorStorage, database, logger)
 	default:
 		// This should never happen due to enum validation, but just in case
 		return fmt.Errorf("invalid search method: %s", c.Method)
@@ -91,30 +92,43 @@ func (c *CLI) setupCommonComponents() (*log.Logger, *time.Location, *db.DB, erro
 	return logger, loc, database, nil
 }
 
-// setupVectorComponents initializes the embedding provider, vector storage, and analyzer
-func (c *CLI) setupVectorComponents(ctx context.Context, logger *log.Logger, database *db.DB) (embeddings.EmbeddingProvider, embeddings.VectorStorage, *analyzer.Analyzer, error) {
+// setupVectorComponents initializes the embedding provider and vector storage
+func (c *CLI) setupVectorComponents(ctx context.Context, logger *log.Logger) (embeddings.EmbeddingProvider, embeddings.VectorStorage, error) {
 	embeddingProvider, err := commands.SetupEmbeddingProvider(ctx, c.EmbeddingConfig, logger)
 	if err != nil {
 		logger.Fatal("Failed to initialize embedding provider", "error", err)
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
 	// Initialize vector storage
 	vectorStorage, err := commands.SetupVectorStorage(ctx, c.DataDir, embeddingProvider, logger)
 	if err != nil {
 		logger.Fatal("Failed to initialize vector storage", "error", err)
-		return embeddingProvider, nil, nil, err
+		return embeddingProvider, nil, err
 	}
 
-	// Initialize analyzer
-	txAnalyzer := analyzer.NewAnalyzer(nil, logger, database, embeddingProvider, vectorStorage)
-
-	return embeddingProvider, vectorStorage, txAnalyzer, nil
+	return embeddingProvider, vectorStorage, nil
 }
 
 // performTextSearch performs a full-text search and displays results
 func (c *CLI) performTextSearch(ctx context.Context, database *db.DB, logger *log.Logger) error {
-	results, totalCount, err := database.SearchTransactionsByText(ctx, c.Query, c.Days, c.Limit)
+	var options []search.SearchOption
+
+	if c.OrderBy == "date" {
+		options = append(options, search.OrderByDate())
+	} else {
+		options = append(options, search.OrderByRelevance())
+	}
+
+	if c.Days > 0 {
+		options = append(options, search.WithDays(c.Days))
+	}
+
+	if c.Limit > 0 {
+		options = append(options, search.WithLimit(c.Limit))
+	}
+
+	results, totalCount, err := search.TextSearch(ctx, database, c.Query, options...)
 	if err != nil {
 		logger.Fatal("Failed to search transactions", "error", err)
 	}
@@ -142,8 +156,28 @@ func (c *CLI) performTextSearch(ctx context.Context, database *db.DB, logger *lo
 }
 
 // performVectorSearch performs a vector search and displays results
-func (c *CLI) performVectorSearch(ctx context.Context, txAnalyzer *analyzer.Analyzer, logger *log.Logger) error {
-	searchResults, err := txAnalyzer.VectorSearch(ctx, c.Query, c.Limit, c.Threshold, c.Days)
+func (c *CLI) performVectorSearch(ctx context.Context, embeddingProvider embeddings.EmbeddingProvider, vectorStorage embeddings.VectorStorage, database *db.DB, logger *log.Logger) error {
+	var options []search.SearchOption
+
+	if c.OrderBy == "date" {
+		options = append(options, search.OrderByDate())
+	} else {
+		options = append(options, search.OrderByRelevance())
+	}
+
+	if c.Days > 0 {
+		options = append(options, search.WithDays(c.Days))
+	}
+
+	if c.Limit > 0 {
+		options = append(options, search.WithLimit(c.Limit))
+	}
+
+	if c.Threshold > 0 {
+		options = append(options, search.WithVectorThreshold(c.Threshold))
+	}
+
+	searchResults, err := search.VectorSearch(ctx, logger, database, embeddingProvider, vectorStorage, c.Query, options...)
 	if err != nil {
 		logger.Fatal("Failed to perform vector search", "error", err)
 	}
@@ -171,8 +205,19 @@ func (c *CLI) performVectorSearch(ctx context.Context, txAnalyzer *analyzer.Anal
 }
 
 // performHybridSearch performs a hybrid search and displays results
-func (c *CLI) performHybridSearch(ctx context.Context, txAnalyzer *analyzer.Analyzer, logger *log.Logger) error {
-	searchResults, err := txAnalyzer.HybridSearch(ctx, c.Query, c.Days, c.Limit, c.Threshold)
+func (c *CLI) performHybridSearch(ctx context.Context, embeddingProvider embeddings.EmbeddingProvider, vectorStorage embeddings.VectorStorage, database *db.DB, logger *log.Logger) error {
+	searchResults, err := search.HybridSearch(
+		ctx,
+		logger,
+		database,
+		embeddingProvider,
+		vectorStorage,
+		c.Query,
+		search.WithLimit(c.Limit),
+		search.WithDays(c.Days),
+		search.OrderByRelevance(),
+		search.WithVectorThreshold(c.Threshold),
+	)
 	if err != nil {
 		logger.Fatal("Failed to perform hybrid search", "error", err)
 	}

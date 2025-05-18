@@ -69,7 +69,7 @@ func (c *UpdateCmd) Run(cli *EmbeddingsCLI) error {
 	}
 	an := analyzer.NewAnalyzer(nil, logger, database, embeddingProvider, vectorStorage)
 
-	err = an.UpdateAllEmbeddings(ctx, analyzer.Config{
+	err = an.UpdateMissingEmbeddings(ctx, analyzer.Config{
 		Concurrency: c.Concurrency,
 		Progress:    !c.NoProgress,
 	})

@@ -7,26 +7,29 @@ import (
 	"strconv"
 
 	"github.com/charmbracelet/log"
-	"github.com/lox/bank-transaction-analyzer/internal/analyzer"
 	"github.com/lox/bank-transaction-analyzer/internal/db"
+	"github.com/lox/bank-transaction-analyzer/internal/embeddings"
+	"github.com/lox/bank-transaction-analyzer/internal/search"
 	"github.com/lox/bank-transaction-analyzer/internal/types"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
 type Server struct {
-	db       *db.DB
-	analyzer *analyzer.Analyzer
-	logger   *log.Logger
-	banks    []string // List of available banks
+	db                 *db.DB
+	logger             *log.Logger
+	banks              []string // List of available banks
+	embeddingsProvider embeddings.EmbeddingProvider
+	vectorStorage      embeddings.VectorStorage
 }
 
-func New(db *db.DB, analyzer *analyzer.Analyzer, logger *log.Logger, banks []string) *Server {
+func New(db *db.DB, logger *log.Logger, embeddingsProvider embeddings.EmbeddingProvider, vectorStorage embeddings.VectorStorage, banks []string) *Server {
 	return &Server{
-		db:       db,
-		analyzer: analyzer,
-		logger:   logger,
-		banks:    banks,
+		db:                 db,
+		logger:             logger,
+		banks:              banks,
+		embeddingsProvider: embeddingsProvider,
+		vectorStorage:      vectorStorage,
 	}
 }
 
@@ -167,11 +170,19 @@ func (s *Server) searchTransactionsHandler(ctx context.Context, request mcp.Call
 		}
 	}
 
-	// Get bank filter if provided
-	//bank, _ := request.Params.Arguments["bank"].(string)
-
-	// Perform the search
-	searchResults, err := s.analyzer.HybridSearch(ctx, query, days, limit, 0.4)
+	// Perform the search using the decoupled search package
+	searchResults, err := search.HybridSearch(
+		ctx,
+		s.logger,
+		s.db,
+		s.embeddingsProvider,
+		s.vectorStorage,
+		query,
+		search.WithLimit(limit),
+		search.WithDays(days),
+		search.OrderByRelevance(),
+		search.WithVectorThreshold(0.4),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search transactions: %w", err)
 	}
@@ -285,7 +296,7 @@ func (s *Server) listTransactionsHandler(ctx context.Context, request mcp.CallTo
 	}
 
 	// Use GetTransactions with the limit parameter and 0 offset
-	var opts []db.GetTransactionsOption
+	var opts []db.TransactionQueryOption
 	opts = append(opts, db.FilterByDays(days))
 	opts = append(opts, db.WithLimit(limit))
 	if category != "" {

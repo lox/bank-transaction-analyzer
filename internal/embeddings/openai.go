@@ -102,7 +102,7 @@ func (p *OpenAIEmbeddingProvider) GenerateEmbedding(ctx context.Context, text st
 	var err error
 	for attempt := uint(0); attempt < p.config.RetryAttempts; attempt++ {
 		t := time.Now()
-		p.logger.Debug("Generating OpenAI embedding", "text_length", len(text), "model", p.config.ModelName)
+		p.logger.Debug("Generating OpenAI embedding", "text", text, "text_length", len(text), "model", p.config.ModelName)
 		resp, err := p.client.CreateEmbeddings(ctx, openai.EmbeddingRequest{
 			Model: openai.EmbeddingModel(p.config.ModelName),
 			Input: []string{text},

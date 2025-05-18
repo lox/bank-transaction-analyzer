@@ -1,7 +1,7 @@
 {
-  "mcpServers": {
-    "bank-transactions": {
-      "command": "./bin/bank-mcp-server"
+    "mcpServers": {
+        "bank-transactions": {
+            "command": "./bin/bank-mcp-server"
+        }
     }
-  }
 }

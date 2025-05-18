@@ -21,11 +21,21 @@ A powerful tool for analyzing bank transactions using language models via OpenRo
   - MCP server for programmatic access
   - Natural language querying through Cursor
 
-- **Performance**
-  - Parallel transaction processing
-  - Optimized database indexes
-  - Efficient search algorithms
+## Terminal User Interface (TUI)
 
+A terminal-based interface for viewing and analyzing transactions interactively.
+
+- **Purpose:** Provides a modern, interactive terminal UI for exploring and searching your bank transactions.
+- **Requirements:** Terminal with ANSI support. Go 1.24+.
+- **How to Build:**
+  ```bash
+  go build ./cmd/bank-transaction-tui
+  ```
+- **How to Run:**
+  ```bash
+  ./cmd/bank-transaction-tui/bank-transaction-tui
+  ```
+- **Framework:** Built using [Bubble Tea](https://github.com/charmbracelet/bubbletea) and related Charm libraries for rich TUI experiences in Go.
 
 ## Banks Supported
 
