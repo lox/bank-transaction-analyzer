@@ -10,8 +10,10 @@ import (
 	"github.com/alecthomas/kong"
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/log"
 	"github.com/lox/bank-transaction-analyzer/internal/commands"
 	"github.com/lox/bank-transaction-analyzer/internal/db"
@@ -19,8 +21,6 @@ import (
 	"github.com/lox/bank-transaction-analyzer/internal/search"
 	"github.com/lox/bank-transaction-analyzer/internal/types"
 )
-
-const itemsPerPage = 15
 
 type keyMap struct {
 	Up          key.Binding
@@ -68,6 +68,7 @@ type model struct {
 	// Search state
 	searchActive           bool
 	searchQuery            string
+	pendingSearchQuery     string
 	searchInput            textinput.Model
 	searchResults          []types.TransactionWithDetails
 	searchTotal            int
@@ -76,6 +77,9 @@ type model struct {
 	embeddingProvider embeddings.EmbeddingProvider
 	vectorStorage     embeddings.VectorStorage
 	logger            *log.Logger
+
+	spinner   spinner.Model
+	searching bool
 }
 
 type transactionDataMsg struct {
@@ -93,6 +97,8 @@ func initialModel(dbConn *db.DB, embeddingProvider embeddings.EmbeddingProvider,
 	ti.Placeholder = "Search..."
 	ti.CharLimit = 156
 	ti.Width = 40
+	sp := spinner.New()
+	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 	return model{
 		db:                dbConn,
 		help:              helpUI,
@@ -106,6 +112,8 @@ func initialModel(dbConn *db.DB, embeddingProvider embeddings.EmbeddingProvider,
 		embeddingProvider: embeddingProvider,
 		vectorStorage:     vectorStorage,
 		logger:            logger,
+		spinner:           sp,
+		searching:         false,
 	}
 }
 
@@ -119,6 +127,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.searchInput.Width = m.width - 2
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		if m.searching {
+			return m, cmd
+		}
 	case tea.KeyMsg:
 		if m.searchActive {
 			if msg.String() == "enter" {
@@ -127,16 +141,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.searchActive = false
 					m.searchQuery = ""
 					m.cursor = 0
+					m.searching = false
+					m.pendingSearchQuery = ""
 					return m, m.fetchTransactionsCmd()
 				}
-				m.searchQuery = query
-				m.searchActive = false
-				return m, m.fetchSearchCmd(query)
+				m.searching = true
+				m.pendingSearchQuery = query
+				return m, tea.Batch(m.fetchSearchCmd(query), m.spinner.Tick)
 			}
 			if msg.String() == "esc" {
 				m.searchActive = false
 				m.searchQuery = ""
 				m.cursor = 0
+				m.searching = false
+				m.pendingSearchQuery = ""
 				return m, m.fetchTransactionsCmd()
 			}
 			var cmd tea.Cmd
@@ -164,7 +182,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.currentTransactionsCount() == 0 {
 				break
 			}
-			m.cursor += itemsPerPage
+			m.cursor += m.itemsPerPage()
 			if m.cursor > m.currentTransactionsCount()-1 {
 				m.cursor = m.currentTransactionsCount() - 1
 			}
@@ -172,7 +190,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.currentTransactionsCount() == 0 {
 				break
 			}
-			m.cursor -= itemsPerPage
+			m.cursor -= m.itemsPerPage()
 			if m.cursor < 0 {
 				m.cursor = 0
 			}
@@ -190,14 +208,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cursor = 0
 		m.searchResults = nil
 		m.searchTotal = 0
+		m.searching = false
+		m.pendingSearchQuery = ""
 	case searchDataMsg:
 		m.ready = true
 		m.err = nil
 		m.searchResults = msg.transactions
 		m.searchTotal = msg.totalCount
 		m.cursor = 0
+		m.searching = false
+		m.searchActive = false
+		m.searchQuery = m.pendingSearchQuery
+		m.pendingSearchQuery = ""
 	case errorMsg:
 		m.err = msg.err
+		m.searching = false
+		m.searchActive = false
+		m.pendingSearchQuery = ""
 	}
 	return m, nil
 }
@@ -264,6 +291,20 @@ func (m model) fetchTransactionsCmd() tea.Cmd {
 	}
 }
 
+func (m model) itemsPerPage() int {
+	// Dynamically calculate help bar height
+	helpLines := strings.Count(m.help.View(struct{ keyMap }{m.keys}), "\n") + 2
+	reserved := 1 + 1 + helpLines // status + blank + help
+	if m.searchActive {
+		reserved++ // for the search bar
+	}
+	page := m.height - reserved
+	if page < 1 {
+		return 1
+	}
+	return page
+}
+
 func (m model) View() string {
 	if m.quitting {
 		return ""
@@ -298,6 +339,7 @@ func (m model) View() string {
 	}
 
 	// Determine the window of transactions to display
+	itemsPerPage := m.itemsPerPage()
 	start := m.cursor - itemsPerPage/2
 	if start < 0 {
 		start = 0
@@ -335,7 +377,11 @@ func (m model) View() string {
 
 	var searchBar string
 	if m.searchActive {
-		searchBar = "/" + m.searchInput.View()
+		if m.searching {
+			searchBar = m.spinner.View() + " /" + m.searchInput.View()
+		} else {
+			searchBar = "/" + m.searchInput.View()
+		}
 	}
 
 	help := m.help.View(struct {
